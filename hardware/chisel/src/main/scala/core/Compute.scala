@@ -68,9 +68,17 @@ class Compute(debug: Boolean = false)(implicit val p: Parameters) extends Module
 
   val inst_q = Module(new SyncQueue(UInt(INST_BITS.W), p(CoreKey).instQueueEntries))
 
+  // PolarFire timing fix: register the head of the instruction queue so the RAM read
+
+  // is not in series with instruction decode + DMA address arithmetic (was the only
+
+  // failing path cone at 125 MHz on MPFS095T). Adds 1 cycle per instruction.
+
+  val inst_head = Queue(inst_q.io.deq, 1, pipe = true)
+
   // decode
   val dec = Module(new ComputeDecode)
-  dec.io.inst := inst_q.io.deq.bits
+  dec.io.inst := inst_head.bits
 
   val inst_type =
     Cat(dec.io.isFinish,
@@ -79,8 +87,8 @@ class Compute(debug: Boolean = false)(implicit val p: Parameters) extends Module
       dec.io.isLoadAcc,
       dec.io.isLoadUop).asUInt
 
-  val sprev = inst_q.io.deq.valid & Mux(dec.io.pop_prev, s(0).io.sready, true.B)
-  val snext = inst_q.io.deq.valid & Mux(dec.io.pop_next, s(1).io.sready, true.B)
+  val sprev = inst_head.valid & Mux(dec.io.pop_prev, s(0).io.sready, true.B)
+  val snext = inst_head.valid & Mux(dec.io.pop_next, s(1).io.sready, true.B)
   val start = snext & sprev
   val done =
     MuxLookup(
@@ -118,11 +126,11 @@ class Compute(debug: Boolean = false)(implicit val p: Parameters) extends Module
 
   // instructions
   inst_q.io.enq <> io.inst
-  inst_q.io.deq.ready := (state === sExe & done) | (state === sSync)
+  inst_head.ready := (state === sExe & done) | (state === sSync)
 
   // uop
   loadUop.io.start := state === sIdle & start & dec.io.isLoadUop
-  loadUop.io.inst := inst_q.io.deq.bits
+  loadUop.io.inst := inst_head.bits
   loadUop.io.baddr := io.uop_baddr
   io.vme_rd(0) <> loadUop.io.vme_rd
   loadUop.io.uop.idx <> Mux(dec.io.isGemm, tensorGemm.io.uop.idx, tensorAlu.io.uop.idx)
@@ -130,7 +138,7 @@ class Compute(debug: Boolean = false)(implicit val p: Parameters) extends Module
 
   // acc
   tensorAcc.io.start := state === sIdle & start & dec.io.isLoadAcc
-  tensorAcc.io.inst := inst_q.io.deq.bits
+  tensorAcc.io.inst := inst_head.bits
   tensorAcc.io.baddr := io.acc_baddr
   require(tensorAcc.io.tensor.lenSplit ==
     tensorAcc.io.tensor.tensorLength, "-F- Expecting a whole batch in acc group")
@@ -160,7 +168,7 @@ class Compute(debug: Boolean = false)(implicit val p: Parameters) extends Module
 
   // gemm
   tensorGemm.io.start := RegNext(state === sIdle & start & dec.io.isGemm, init = false.B)
-  tensorGemm.io.dec := inst_q.io.deq.bits.asTypeOf(new GemmDecode)
+  tensorGemm.io.dec := inst_head.bits.asTypeOf(new GemmDecode)
   tensorGemm.io.uop.data.valid := loadUop.io.uop.data.valid & dec.io.isGemm
   tensorGemm.io.uop.data.bits <> loadUop.io.uop.data.bits
   tensorGemm.io.inp <> io.inp
@@ -178,7 +186,7 @@ class Compute(debug: Boolean = false)(implicit val p: Parameters) extends Module
 
   // alu
   tensorAlu.io.start := RegNext(state === sIdle & start & dec.io.isAlu, init = false.B)
-  tensorAlu.io.dec := inst_q.io.deq.bits.asTypeOf(new AluDecode)
+  tensorAlu.io.dec := inst_head.bits.asTypeOf(new AluDecode)
   tensorAlu.io.uop.data.valid := loadUop.io.uop.data.valid & dec.io.isAlu
   tensorAlu.io.uop.data.bits <> loadUop.io.uop.data.bits
   for (idx <- 0 until tensorAlu.io.acc.splitWidth) {

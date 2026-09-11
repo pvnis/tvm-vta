@@ -48,16 +48,20 @@ class Load(debug: Boolean = false)(implicit p: Parameters) extends Module {
 
   val s = Module(new Semaphore(counterBits = 8, counterInitValue = 0))
   val inst_q = Module(new Queue(UInt(INST_BITS.W), p(CoreKey).instQueueEntries))
+  // PolarFire timing fix: register the head of the instruction queue so the RAM read
+  // is not in series with instruction decode + DMA address arithmetic (was the only
+  // failing path cone at 125 MHz on MPFS095T). Adds 1 cycle per instruction.
+  val inst_head = Queue(inst_q.io.deq, 1, pipe = true)
 
   val dec = Module(new LoadDecode)
-  dec.io.inst := inst_q.io.deq.bits
+  dec.io.inst := inst_head.bits
 
   val tensorType = Seq("inp", "wgt")
   val tensorDec = Seq(dec.io.isInput, dec.io.isWeight)
   val tensorLoad =
     Seq.tabulate(2)(i => Module(new TensorLoad(tensorType = tensorType(i))))
 
-  val start = inst_q.io.deq.valid & Mux(dec.io.pop_next, s.io.sready, true.B)
+  val start = inst_head.valid & Mux(dec.io.pop_next, s.io.sready, true.B)
   val done = Mux(dec.io.isInput, tensorLoad(0).io.done, tensorLoad(1).io.done)
 
   // control
@@ -83,7 +87,7 @@ class Load(debug: Boolean = false)(implicit p: Parameters) extends Module {
 
   // instructions
   inst_q.io.enq <> io.inst
-  inst_q.io.deq.ready := (state === sExe & done) | (state === sSync)
+  inst_head.ready := (state === sExe & done) | (state === sSync)
 
   // load tensor
   // [0] input (inp)
@@ -92,7 +96,7 @@ class Load(debug: Boolean = false)(implicit p: Parameters) extends Module {
   val tsor = Seq(io.inp, io.wgt)
   for (i <- 0 until 2) {
     tensorLoad(i).io.start := state === sIdle & start & tensorDec(i)
-    tensorLoad(i).io.inst := inst_q.io.deq.bits
+    tensorLoad(i).io.inst := inst_head.bits
     tensorLoad(i).io.baddr := ptr(i)
     tensorLoad(i).io.tensor <> tsor(i)
     io.vme_rd(i) <> tensorLoad(i).io.vme_rd
