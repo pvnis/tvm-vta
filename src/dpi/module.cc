@@ -41,6 +41,11 @@
 // Include verilator array access functions code
 #include "verilated.cpp"
 #include "verilated_dpi.cpp"
+// Verilator 5 always references its thread pool (VlThreadPool) from verilated.cpp,
+// even for single-threaded models, and defines it in verilated_threads.cpp.
+#if defined(VERILATOR_VERSION_INTEGER) && VERILATOR_VERSION_INTEGER >= 5000000
+#include "verilated_threads.cpp"
+#endif
 
 namespace vta {
 namespace dpi {
@@ -282,7 +287,7 @@ class DPIModule final : public DPIModuleNode {
   }
 
   PackedFunc GetFunction(
-      const std::string& name,
+      const String& name,
       const ObjectPtr<Object>& sptr_to_self) final {
     if (name == "WriteReg") {
       return TypedPackedFunc<void(int, int)>(

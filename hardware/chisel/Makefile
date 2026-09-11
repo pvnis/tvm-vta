@@ -93,7 +93,7 @@ else
 	cxx_flags = -O0 -g -Wall
 endif
 
-cxx_flags += -std=c++11 -Wno-maybe-uninitialized
+cxx_flags += -std=c++17 -Wno-maybe-uninitialized
 ifeq ($(CXX_HAS_ALIGN_NEW),true)
 	cxx_flags += -faligned-new
 endif
@@ -104,6 +104,9 @@ cxx_flags += -DVM_COVERAGE=0
 cxx_flags += -DVM_SC=0
 cxx_flags += -Wno-sign-compare
 cxx_flags += -include V$(TOP_TEST).h
+# Verilator 5's top header no longer pulls in the DPI header, so without this the DPI
+# functions in tsim_device.cc get C++ linkage and the model's extern "C" imports fail.
+cxx_flags += -include V$(TOP_TEST)__Dpi.h
 cxx_flags += -I$(verilator_build_dir)
 cxx_flags += -I$(VERILATOR_INC_DIR)
 cxx_flags += -I$(VERILATOR_INC_DIR)/vltstd
@@ -121,6 +124,11 @@ ifeq ($(SANITIZE), 1)
 endif
 
 cxx_objs = $(verilator_build_dir)/verilated.o $(verilator_build_dir)/verilated_dpi.o $(verilator_build_dir)/tsim_device.o
+# Verilator 5 models always need the thread pool runtime, even when single-threaded.
+VERILATOR_MAJOR := $(shell verilator --version 2>/dev/null | awk '{print $$2}' | cut -d. -f1)
+ifeq ($(shell [ "$(VERILATOR_MAJOR)" -ge 5 ] 2>/dev/null && echo y),y)
+	cxx_objs += $(verilator_build_dir)/verilated_threads.o
+endif
 
 ifneq ($(USE_TRACE), 0)
 	cxx_flags += -DVM_TRACE=1
