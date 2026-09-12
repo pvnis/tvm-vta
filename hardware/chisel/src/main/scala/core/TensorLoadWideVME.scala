@@ -742,6 +742,13 @@ class GenVMECmdWideTL(tensorType: String = "none", debug: Boolean = false)(
   })
 
   val dec = io.inst.asTypeOf(new MemDecode)
+  // PolarFire timing: latch the instruction at start and feed cmdGen the fields it only uses
+  // AFTER the start cycle from that local copy. io.inst is held stable for the whole transfer,
+  // so decR == dec in those cycles and behaviour is unchanged; this keeps the deep
+  // xsize -> rdLen -> stride -> rdCmdStartIdx cone off the long route from the shared
+  // instruction register. sram_offset / xpad_0 / dram_offset stay live: cmdGen uses them in
+  // its own when(io.start) branch.
+  val decR = RegEnable(io.inst, io.start).asTypeOf(new MemDecode)
 
   val cmdGen = Module (new GenVMECmdWide(tensorType, debug))
 
@@ -752,14 +759,14 @@ class GenVMECmdWideTL(tensorType: String = "none", debug: Boolean = false)(
   io.readLen :=  cmdGen.io.readLen
   io.done :=  cmdGen.io.done
 
-  cmdGen.io.ysize := dec.ysize
-  cmdGen.io.xsize := dec.xsize
-  cmdGen.io.xstride := dec.xstride
+  cmdGen.io.ysize := decR.ysize
+  cmdGen.io.xsize := decR.xsize
+  cmdGen.io.xstride := decR.xstride
   cmdGen.io.dram_offset := dec.dram_offset
   cmdGen.io.sram_offset := dec.sram_offset
   cmdGen.io.xpad_0 := dec.xpad_0
-  cmdGen.io.xpad_1 := dec.xpad_1
-  cmdGen.io.ypad_0 := dec.ypad_0
+  cmdGen.io.xpad_1 := decR.xpad_1
+  cmdGen.io.ypad_0 := decR.ypad_0
   cmdGen.io.updateState := io.vmeCmd.fire
   cmdGen.io.canSendCmd := true.B
 }

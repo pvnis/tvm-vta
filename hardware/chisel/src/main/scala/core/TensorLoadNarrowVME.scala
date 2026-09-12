@@ -564,6 +564,12 @@ class GenVMECmd(tensorType: String = "none", debug: Boolean = false)(
 
 
   val dec = io.inst.asTypeOf(new MemDecode)
+  // PolarFire timing: latch the instruction locally at start. Every use below other than the
+  // io.start branches is evaluated only in later cycles, where decR == dec because the
+  // instruction queue holds io.inst stable for the whole transfer. Behaviour is unchanged;
+  // this removes the long, high-fanout path from the shared instruction register into the
+  // address arithmetic - the last cone failing 125 MHz on MPFS095T.
+  val decR = RegEnable(io.inst, io.start).asTypeOf(new MemDecode)
 
   val rdCmdExtAddr = Reg(UInt(mp.addrBits.W)) // current address in the row
   val maxTransfer = (1 << mp.lenBits).U // max number of blocks in transfer
@@ -587,7 +593,7 @@ class GenVMECmd(tensorType: String = "none", debug: Boolean = false)(
   val readLen = Wire(UInt((mp.lenBits + 1).W)) // read cmd transaction length. It is <= maxTransfer
   val commandsDone = RegInit(true.B) // Done generating VME commands
   val stride = Wire(Bool()) // flags change to the next row to read
-  val blocksReadSize = (dec.xsize << log2Ceil(sizeFactor)) // how many blocks to read in a singl src row
+  val blocksReadSize = (decR.xsize << log2Ceil(sizeFactor)) // how many blocks to read in a singl src row
   val blocksReadNb = Reg(blocksReadSize.cloneType)
   val rdCmdExtAddrRowBegin = Reg(UInt(mp.addrBits.W)) // starting address in the row
   val newReadRow = Reg(Bool()) // flags the first read of dec.xsize
@@ -610,7 +616,7 @@ class GenVMECmd(tensorType: String = "none", debug: Boolean = false)(
   }.elsewhen (io.vmeCmd.fire) {
     val nextBlRNb = blocksReadNb + readLen
     blocksReadNb := nextBlRNb // THIS IS WHEN A NEW VME CMD HAPPENS
-    when (nextBlRNb === blocksReadSize && srcRowIdx === dec.ysize - 1.U) {
+    when (nextBlRNb === blocksReadSize && srcRowIdx === decR.ysize - 1.U) {
       commandsDone := true.B
     }
   }.otherwise {
@@ -618,7 +624,7 @@ class GenVMECmd(tensorType: String = "none", debug: Boolean = false)(
   }
 
   //when the whole xsize row read commands send, go for the next src row
-  when((blocksReadNb === blocksReadSize - readLen) && (srcRowIdx =/= dec.ysize - 1.U) && io.vmeCmd.fire) {
+  when((blocksReadNb === blocksReadSize - readLen) && (srcRowIdx =/= decR.ysize - 1.U) && io.vmeCmd.fire) {
     stride := true.B
   }.otherwise {
     stride := false.B
@@ -640,20 +646,20 @@ class GenVMECmd(tensorType: String = "none", debug: Boolean = false)(
     }
   }
   // block index of the read data row (xsize). Modified by zero padding
-  val totalWidth = dec.xsize + dec.xpad_0 + dec.xpad_1 // width of scratchpad matrix in tensors
+  val totalWidth = decR.xsize + decR.xpad_0 + decR.xpad_1 // width of scratchpad matrix in tensors
   // instead of multiplying total width by ypad_0 do incremental addition.
   //Should cost ypad_0 cycles to issue 1st read cmd
   // counts src matrix with y padding rows of tensors
   val currentRowIdx = Reg(UInt((dec.ysize.getWidth + dec.ypad_0.getWidth).W))
   // start to issue read cmd
-  rdCmdStartIdxValid := currentRowIdx >= dec.ypad_0 &&
-    currentRowIdx < (dec.ysize + dec.ypad_0) &&
+  rdCmdStartIdxValid := currentRowIdx >= decR.ypad_0 &&
+    currentRowIdx < (decR.ysize + decR.ypad_0) &&
     io.isBusy &&
     !commandsDone
   when (io.start) {
     currentRowIdx := 0.U
     rdCmdStartIdx := dec.sram_offset + dec.xpad_0 // this index is in tensors
-  }.elsewhen (io.isBusy && (currentRowIdx < dec.ypad_0 || stride)) {
+  }.elsewhen (io.isBusy && (currentRowIdx < decR.ypad_0 || stride)) {
     rdCmdStartIdx := rdCmdStartIdx + totalWidth
     currentRowIdx := currentRowIdx + 1.U
   }
@@ -669,7 +675,7 @@ class GenVMECmd(tensorType: String = "none", debug: Boolean = false)(
     newReadRow := true.B
   }.elsewhen (io.vmeCmd.fire) {
     when(stride) {
-      val memRow = rdCmdExtAddrRowBegin + (dec.xstride << log2Ceil(elemBytes))
+      val memRow = rdCmdExtAddrRowBegin + (decR.xstride << log2Ceil(elemBytes))
       rdCmdExtAddr := memRow //  go to the next source matrix row with xstride tensors offset
       rdCmdExtAddrRowBegin := memRow
       newReadRow := true.B
