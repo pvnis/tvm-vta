@@ -235,3 +235,6 @@ conda/pkg
 *.tokens
 *.interp
 tvm/
+
+# sbt scratch
+hardware/chisel/project/project/
