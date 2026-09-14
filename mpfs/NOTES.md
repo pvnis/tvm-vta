@@ -369,3 +369,41 @@ Also fixed: build_board_runtime.sh was starting its own nohup'd server, which fo
 vta-rpc.service for port 9091 - the loser silently binds 9092, so the host keeps talking to
 a stale binary and tests appear not to respond to code changes. It now goes through
 systemctl and asserts the server came up on 9091.
+
+## The wedging is NOT GEMM-specific - marginal timing is back in play (2026-09-14, later still)
+
+New observation that changes the diagnosis. From a fresh reset, with NO GEMM anywhere in the
+sequence:
+
+    alu 1  PASS
+    alu 2  PASS
+    alu 4  HANG      <- and everything after it hangs too
+
+So VTA stops completing programs after a handful of runs on its own. Earlier in the day it
+managed five in a row (alu 1/2/4 + two pads) before any GEMM had been issued, so the number
+of programs before it wedges varies. That is not the signature of a logic bug in the GEMM
+datapath; it is the signature of something marginal.
+
+Which puts timing back in the frame, despite the clean report. Post-layout worst slack is
++0.056 ns on an 8 ns period - 0.7% margin - and the notes above already predicted this:
+VTA standalone sat ON the 125 MHz edge across seeds (-0.155 to +0.067), and integration with
+the reference design was expected to push it negative. A 0.7% margin does not survive IR
+drop, jitter or delay-model error. On-die temperature during these runs is 62.8 C
+(/sys/class/hwmon/hwmon0, mpfs_tvs), within the analyzed 0-100 C range, so temperature alone
+does not explain it - but it does not need to, at that margin.
+
+It also re-explains GEMM: GEMM lights up far more of the fabric (the MAC array plus the wgt
+scratchpad) than an ALU shift does, so if the part is marginal, GEMM is what fails first and
+every time, while ALU fails only occasionally.
+
+RECOMMENDED NEXT STEP, revised: rebuild the integrated design with VTA on a slower clock -
+Plan A from the integration notes, 100 MHz on its own FIC clock (each MSS FIC has an
+independent fabric clock, so no CDC work is needed). If GEMM then computes correctly and
+long ALU sequences stop wedging, this was timing all along and the AXI-bridge theory can be
+dropped. That is a much cheaper experiment than building an AXI testbench, and unlike the
+earlier situation the evidence now points at it. The one caveat is that it is a multi-hour
+Libero run.
+
+Keep in mind when interpreting any future hardware result: every measurement taken after a
+program has wedged the device is worthless. Reset first (reset_board.sh), and treat only the
+first program after a reset as trustworthy.
