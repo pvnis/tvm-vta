@@ -558,3 +558,53 @@ That makes it the safest clock in the design to borrow.
 it is decisive either way: if the board boots and VTA behaves, the PLL was the problem and
 the timing hypothesis is confirmed; if it still hangs, the culprit is the interconnect CDC,
 which is the only remaining change.
+
+## Attempt 3 (50 MHz, no PLL): same hang - the culprit is the interconnect CDC
+
+Borrowed FIC_3_CLK (50 MHz) with NO new PLL and no new CORERESET. Timing was comfortable
+(VTA domain +4.147 ns on a 20 ns period, FIC0 +3.806 ns). Same failure: HSS stops at
+"Initializing Mi-V IHC V2" and watchdog-loops.
+
+Three attempts, three different clock arrangements, one identical failure:
+  v1  new PLL referenced from the REF_CLK_50MHz pad      -> hang
+  v2  new PLL referenced from FIC_0_CLK                  -> hang
+  v3  no PLL at all, borrowed FIC_3_CLK                  -> hang
+
+So neither the PLL nor the reference-clock pad was ever the cause. Both earlier theories
+are retracted.
+
+A component-by-component netlist comparison against the working build settles what is left.
+Exactly four components differ, all of them intended:
+  DMA_INITIATOR      MASTER1_CLOCK_DOMAIN_CROSSING 0 -> 1, M_CLK1 GND -> M_CLK1
+  FIC0_INITIATOR     SLAVE2_CLOCK_DOMAIN_CROSSING  0 -> 1, S_CLK2 GND -> S_CLK2
+  FIC_0_PERIPHERALS  VTA's clock/reset and the two crossing clocks
+  MPFS_DISCOVERY_KIT the two taps onto the existing FIC_3 clock and reset nets
+MSS, FIC_3_PERIPHERALS (which contains the Mi-V IHC that HSS hangs on) and
+CLOCKS_AND_RESETS are byte-identical in connectivity. The build flow is not corrupting
+anything, and the constraint sets match too.
+
+=> Enabling CLOCK_DOMAIN_CROSSING on a port of the SHARED system interconnects is what
+breaks the design.
+
+### The likely mistake: where the CDC belongs
+
+Re-reading what Microchip actually does for VectorBlox: they do NOT enable CDC on a port of
+the main FIC0 interconnect. They instantiate a SEPARATE CoreAXI4Interconnect
+(vectorblox_axi_resize) as a dedicated 1x1 bridge with MASTER0_CLOCK_DOMAIN_CROSSING:true,
+sitting between the accelerator and the rest of the system, with its own ACLK and M_CLK0.
+The system interconnects stay single-clock.
+
+I copied the parameter but not the topology: CDC went onto FIC0_INITIATOR and DMA_INITIATOR,
+the interconnects that carry ALL the MSS traffic to FIC0. If enabling CDC on one port
+disturbs that interconnect's reset or ready behaviour, everything behind it stalls, which is
+consistent with the MSS hanging on its first fabric access.
+
+Next step if this is pursued: leave FIC0_INITIATOR and DMA_INITIATOR untouched (CDC off) and
+put a dedicated CoreAXI4Interconnect bridge instance on each side of VTA to do the crossing,
+exactly as VectorBlox does.
+
+### Cost so far
+
+Three full build+program cycles (~1 h each) to eliminate two wrong theories and land on the
+right suspect. Recovery is now cheap (cp -a the known-good project, program, ~3 min), and
+MPFS_DISCOVERY.{100mhz,100mhz.v2,50mhz} are kept for comparison.

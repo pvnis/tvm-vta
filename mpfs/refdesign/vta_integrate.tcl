@@ -74,15 +74,11 @@ hdl_core_add_bif -hdl_core_name {XilinxShell} -bif_definition {AXI4:AMBA:AMBA4:s
 "RRESP:s_axi_control_RRESP" }
 
 
-# VTA runs in its own 100 MHz clock domain, not on FIC_0_CLK. At 125 MHz the post-layout
-# worst slack was +0.056 ns - 0.7% of the period - and on hardware the accelerator
-# intermittently stopped completing programs, so it is given margin instead. Its two AXI
-# ports cross back into the 125 MHz FIC0 domain inside CoreAXI4Interconnect, which does the
-# CDC itself when a port has CLOCK_DOMAIN_CROSSING enabled (the arrangement Microchip uses
-# for VectorBlox here). The clock comes from a dedicated PLL rather than from retuning a FIC
-# clock, because MSS_DLL_LOCKS ANDs all four MSS FIC DLL locks and gates the reset release
-# of every fabric domain.
-source /home/dmd/polarfire_sandbox/refdesign-vta/script_support/additional_configurations/vta/VTA_CCC.tcl
+# VTA does not run on FIC_0_CLK. At 125 MHz the post-layout worst slack was +0.056 ns -
+# 0.7% of the period - and on hardware the accelerator intermittently stopped completing
+# programs, so it is given margin instead. Its two AXI ports cross back into the 125 MHz
+# FIC0 domain inside CoreAXI4Interconnect, which does the CDC itself when a port has
+# CLOCK_DOMAIN_CROSSING enabled (the arrangement Microchip uses for VectorBlox here).
 
 set sd FIC_0_PERIPHERALS
 open_smartdesign -sd_name $sd
@@ -91,49 +87,49 @@ sd_update_instance -sd_name $sd -instance_name {FIC0_INITIATOR}
 source /home/dmd/polarfire_sandbox/refdesign-vta/script_support/additional_configurations/vta/DMA_INITIATOR.vta.tcl
 sd_update_instance -sd_name $sd -instance_name {DMA_INITIATOR}
 
-# VTA's PLL is referenced from FIC_0_CLK, the clock this SmartDesign already runs on.
-# Do NOT reference the board's REF_CLK_50MHz pad instead: a second load on that pad makes
-# Libero insert a CLKINT global buffer, the main CCC loses its dedicated CCC_SW_CLKIN route,
-# and the reference path of every FIC clock changes. The first attempt did that and the
-# board stopped booting - HSS hung on its first fabric-peripheral access, which is what
-# MSS_DLL_LOCKS holding all the fabric resets looks like.
-sd_instantiate_component -sd_name $sd -component_name {VTA_CCC} -instance_name {VTA_CCC_0}
-sd_connect_pins -sd_name $sd -pin_names {"ACLK" "VTA_CCC_0:REF_CLK_0"}
-
-# Reset synchronizer for the new domain. CORERESET already exists in this project (the
-# reference design instantiates one per FIC clock); this is another instance of it, held in
-# reset until both the VTA PLL has locked and the FIC0 domain is out of reset.
-sd_instantiate_component -sd_name $sd -component_name {CORERESET} -instance_name {VTA_RESET}
-sd_connect_pins -sd_name $sd -pin_names {"VTA_CCC_0:OUT0_FABCLK_0" "VTA_RESET:CLK"}
-sd_connect_pins -sd_name $sd -pin_names {"VTA_CCC_0:PLL_LOCK_0" "VTA_RESET:PLL_LOCK"}
-sd_connect_pins -sd_name $sd -pin_names {"ARESETN" "VTA_RESET:EXT_RST_N"}
-sd_connect_pins_to_constant -sd_name $sd -pin_names {VTA_RESET:BANK_x_VDDI_STATUS} -value {VCC}
-sd_connect_pins_to_constant -sd_name $sd -pin_names {VTA_RESET:BANK_y_VDDI_STATUS} -value {VCC}
-sd_connect_pins_to_constant -sd_name $sd -pin_names {VTA_RESET:SS_BUSY} -value {GND}
-sd_connect_pins_to_constant -sd_name $sd -pin_names {VTA_RESET:FF_US_RESTORE} -value {GND}
-sd_connect_pins_to_constant -sd_name $sd -pin_names {VTA_RESET:INIT_DONE} -value {VCC}
-sd_connect_pins_to_constant -sd_name $sd -pin_names {VTA_RESET:FPGA_POR_N} -value {VCC}
-# This CCC configuration does not expose a PLL powerdown input, so the reset's powerdown
-# output has nowhere to go - the same thing VectorBlox does with its two CORERESET instances.
-sd_mark_pins_unused -sd_name $sd -pin_names {VTA_RESET:PLL_POWERDOWN_B}
+# VTA runs on FIC_3_CLK (50 MHz), borrowed from the existing clock tree - NO new PLL.
+#
+# Two attempts at 100 MHz with a dedicated PLL both left the board unbootable, HSS hanging on
+# its first fabric-peripheral access (Mi-V IHC, which is on FIC3). The second attempt was
+# connectivity-identical to the working design at the top level and still failed, so the
+# cause is inside this SmartDesign, and a fabric PLL referenced from an existing critical
+# clock is the common factor. The design has no 100 MHz clock to borrow, so keeping 100 MHz
+# would mean keeping the suspect; 50 MHz still gives VTA a 20 ns period against the 8 ns it
+# was failing at.
+#
+# FIC_3_CLK is the safest clock in the design to borrow: its MSS DLL is DISABLED
+# (FIC_3_EMBEDDED_DLL_USED false), so adding fabric loads to it cannot break the
+# MSS_DLL_LOCKS chain that gates the reset of every fabric peripheral.
+sd_create_scalar_port -sd_name $sd -port_name {VTA_CLK} -port_direction {IN}
+sd_create_scalar_port -sd_name $sd -port_name {VTA_ARESETN} -port_direction {IN}
 
 sd_instantiate_hdl_core -sd_name $sd -hdl_core_name {XilinxShell} -instance_name {VTA_0}
 sd_connect_pins -sd_name $sd -pin_names {"FIC0_INITIATOR:AXI4mslave2" "VTA_0:s_axi_control"}
 sd_connect_pins -sd_name $sd -pin_names {"VTA_0:m_axi_gmem" "DMA_INITIATOR:AXI4mmaster1"}
-# VTA and the fabric-facing side of both crossings run on the 100 MHz clock; the
-# interconnects' own ACLK stays on FIC_0_CLK.
-sd_connect_pins -sd_name $sd -pin_names {"VTA_CCC_0:OUT0_FABCLK_0" "VTA_0:ap_clk" \
+# VTA and the fabric-facing side of both crossings run on the borrowed clock; the
+# interconnects' own ACLK stays on FIC_0_CLK at 125 MHz.
+sd_connect_pins -sd_name $sd -pin_names {"VTA_CLK" "VTA_0:ap_clk" \
     "DMA_INITIATOR:M_CLK1" "FIC0_INITIATOR:S_CLK2"}
-sd_connect_pins -sd_name $sd -pin_names {"VTA_RESET:FABRIC_RESET_N" "VTA_0:ap_rst_n"}
+sd_connect_pins -sd_name $sd -pin_names {"VTA_ARESETN" "VTA_0:ap_rst_n"}
 save_smartdesign -sd_name $sd
-# Nothing outside this SmartDesign changes now: VTA's PLL is referenced from ACLK, which
-# FIC_0_PERIPHERALS already receives, so the top level needs no new port or connection.
+# Regenerate before touching the top level: until the hierarchy is rebuilt, the
+# FIC_0_PERIPHERALS_0 instance does not expose the ports added above.
 build_design_hierarchy
 generate_component -component_name {FIC_0_PERIPHERALS} -recursive 1
-generate_component -component_name {MPFS_DISCOVERY_KIT} -recursive 1
-puts "VTA: integrated into $sd at 100 MHz (own PLL, CDC in the interconnects)"
 
-# Re-derive timing constraints so the new PLL output is a known clock, then tell the tools
+# Join the existing FIC_3 clock and reset nets by naming a pin already on each: those nets
+# are already driven, and connecting a driver a second time is rejected.
+set top MPFS_DISCOVERY_KIT
+open_smartdesign -sd_name $top
+sd_update_instance -sd_name $top -instance_name {FIC_0_PERIPHERALS_0}
+sd_connect_pins -sd_name $top -pin_names {"FIC_3_PERIPHERALS_0:PCLK" "FIC_0_PERIPHERALS_0:VTA_CLK"}
+sd_connect_pins -sd_name $top -pin_names {"FIC_3_PERIPHERALS_0:PRESETN" "FIC_0_PERIPHERALS_0:VTA_ARESETN"}
+save_smartdesign -sd_name $top
+build_design_hierarchy
+generate_component -component_name {MPFS_DISCOVERY_KIT} -recursive 1
+puts "VTA: integrated into $sd on FIC_3_CLK (50 MHz), CDC in the interconnects"
+
+# Re-derive timing constraints, then tell the tools
 # that the VTA and FIC0 domains are unrelated - the only paths between them go through the
 # interconnects' CDC synchronizers.
 # The hierarchy has to be rebuilt after regenerating the top component, otherwise deriving
