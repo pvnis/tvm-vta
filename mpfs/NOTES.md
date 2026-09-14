@@ -721,3 +721,65 @@ meaningful needs the Verilog side (VTAMemDPI.v and the VME-to-DPI adapter) to ac
 read request before the previous one completes. That is the next concrete step for #1: with
 it, the ID demux can be tested in simulation, and if it breaks there we have the hardware
 bug reproduced without an FPGA build.
+
+## ============ STATUS AT THIS POINT (2026-09-15) ============
+
+### What works on hardware
+  hw_test.py mem                DMA round-trip through the reserved non-cached pool
+  hw_test.py alu 1 / 2 / 4      ACC load -> ALU shift -> OUT -> store, bit-exact (576/576)
+  hw_test.py pad (2 cases)      padded ACC load, bit-exact (560/560)
+  wedge_stress.py 2000          2000 back-to-back executions, varying inputs, all correct
+
+### What does not work
+  1. GEMM returns all zeros. THE blocker: conv2d and dense are GEMM, so no DNN layer runs.
+  2. Intermittent wedge. Real, observed many times, sticky until a fabric reset, but has not
+     reproduced in 16,000+ executions since; cause unknown, no validated fix.
+  3. (done) Driver hangs -> now a wall-clock timeout with a register dump.
+  4. (parked) VTA on a slower clock - blocked on the CDC topology, and NOT on the critical
+     path for 1 or 2.
+
+### Fixed this session
+  - DMA buffers must be aligned to the VTA tensor ELEMENT size (256 B for wgt here), not 64.
+    Misalignment silently truncated the weight address to the output buffer. Real bug,
+    independent of everything else, would have corrupted any weight-using workload.
+  - VTADeviceRun wall-clock timeout + register diagnostics instead of an unbounded spin.
+  - Board bring-up chain: iomem=relaxed, rv64gc/lp64d ABI pinning, VTA_MAX_XFER sizing.
+
+### Hypotheses for #1 (GEMM zeros), with the evidence
+
+  RULED OUT
+    Schedule wrong .............. same schedule passes in FSIM
+    RTL compute wrong ........... passes in TSIM on a netlist md5-identical to the synthesized
+                                  one - but see the caveat below, this covers compute only
+    Instruction stream differs .. dumped both; TSIM and hardware execute identical streams
+    Wrong addresses ............. driver dump: wgt -> 0xC4000200, matching the allocation
+    Wrong data in DRAM .......... read back from a separate process: exact one-hot pattern
+    Store never happens ......... output sentinel is overwritten with zeros
+    Buffer misalignment ......... found and fixed; GEMM still zero afterwards
+    Timing ...................... met, and fully constrained
+    Module concurrency .......... VTA_DEBUG_FORCE_SERIAL does not fix it
+    Gapped read beats ........... VTA_TSIM_RD_GAP=2,4 still pass in TSIM
+    Different load module ....... inp, wgt AND acc all use TensorLoadNarrowVME
+
+  OPEN, most likely first
+    H1. VME's ID-based response demultiplexing. VME tags each read with ar.bits.id and routes
+        the data by r.bits.id (VME.scala:280,292,297). Under TSIM this is never exercised:
+        max outstanding reads = 1, tag always 0. On hardware up to 16 can be in flight across
+        fetch/load/compute. This is the only major block of logic with zero coverage, and it
+        sits exactly where inp/wgt loads would break while simpler traffic survives.
+    H2. AXI ID truncation in the integration. VTA's DMA-path ID is cut 9 -> 4 bits at the MSS
+        boundary (ARID_0_3to0 = ARID[3:0], RID_0_8to4 = 5'h0), dropping the bit
+        CoreAXI4Interconnect appends to identify the issuing master. VTA's own tags (0-15)
+        survive, so this only bites if the interconnect needs that bit on the return path.
+        Related to H1 and testable on the same rig.
+    H3. Something else in XilinxShell's AXI bridge. TSIM replaces the whole shell with a DPI
+        model, so nothing in it is simulated.
+
+  Note H1/H2/H3 all live in the same untested region: the memory interface. That is why the
+  next step is to give TSIM the ability to exercise it, rather than another FPGA build.
+
+### Next step (in progress)
+  Make the Verilog DPI shell accept a new read request before the previous one completes, so
+  multiple reads with distinct tags are in flight. Then VTA_TSIM_RD_OOO (already in the C++
+  model) becomes meaningful and H1/H2 can be tested in simulation. If GEMM breaks there, the
+  hardware bug is reproduced with no FPGA build in the loop.
