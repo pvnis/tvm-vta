@@ -783,3 +783,45 @@ bug reproduced without an FPGA build.
   multiple reads with distinct tags are in flight. Then VTA_TSIM_RD_OOO (already in the C++
   model) becomes meaningful and H1/H2 can be tested in simulation. If GEMM breaks there, the
   hardware bug is reproduced with no FPGA build in the loop.
+
+## H1 and H2 RULED OUT: VTA issues one read at a time (2026-09-15)
+
+Built the thing the previous entry proposed: VTAMemDPIToAXI now has a multi-outstanding mode
+(elaborate with VTA_TSIM_MULTI_RD=1) that hands every queued AR to the DPI as it arrives
+instead of serving one burst at a time, with per-id beat counters for r.last. One trap worth
+recording: the C++ model resolves rd_req_addr through the virtual memory manager whenever it
+is non-zero WITHOUT checking rd_req_valid, so the request address must be forced to 0 when
+not issuing - the in-order path never hit this because it drove a held register, and the
+first version aborted the simulation on a bogus address.
+
+With that in place, and even with the memory model slowed to one beat every 32 cycles:
+
+    TSIM memory: outstanding reads reached 1 (ids in flight: 0)
+
+VTA never has more than ONE read outstanding, whatever the memory latency. So for this
+workload:
+
+  H1 (VME's ID-based response demultiplexing) - RULED OUT. With a single transaction in
+     flight and a single tag, there is nothing to demultiplex. The logic is still untested,
+     but it cannot be what breaks GEMM.
+  H2 (the 9->4 bit AXI ID truncation at the MSS boundary) - RULED OUT for the same reason.
+     Response routing is unambiguous with one outstanding transaction.
+
+Burst shapes, logged per request, also fail to separate the working case from the broken one:
+
+    GEMM: 20 beats (insn), 1 (uop), 4 (inp = 2 tensors x 2), 64 (wgt = 2 x 32), 1 (uop)
+    ALU:  14 beats (insn), 256 (acc), 32, 1
+
+All legal AXI4, all correctly sized for their tensors, none crossing a 4 KB boundary - and
+the ALU case that WORKS on hardware issues a bigger burst (256 beats) than anything GEMM
+does. So burst length is not the discriminator either.
+
+That leaves H3: something in XilinxShell's AXI bridge itself, which TSIM replaces wholesale
+with the DPI shell and therefore never simulates. Narrowing it further from the host side
+looks exhausted; the honest next step is hardware observation (Libero SmartDebug live probes
+on the VME/AXI signals, or an ILA on m_axi_gmem) rather than more simulation.
+
+Note: tvm-vta/build/libvta_hw.so is currently built WITH VTA_TSIM_MULTI_RD=1 (it passes
+GEMM and ALU in TSIM). Rebuild without the variable for stock behaviour; the Makefile does
+not track Scala changes, so delete build/chisel, build/verilator and build/libvta_hw.so
+first, and sbt needs JDK 11 plus tools/sbt on PATH (see the top of this file).

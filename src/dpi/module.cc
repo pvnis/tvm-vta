@@ -236,6 +236,10 @@ void MemDevice::SetRequest(
     if(rd_req_valid == 1) {
       rq_.push_back(ReadReq{reinterpret_cast<uint64_t*>(rd_vaddr), rd_req_len + 1,
                             rd_req_id});
+      // Log every read burst: address, beats and tag. The burst SHAPE is what differs
+      // between the tensors that work on hardware (acc) and those that do not (inp, wgt).
+      LOG(INFO) << "TSIM rd: addr=0x" << std::hex << rd_req_addr << std::dec
+                << " beats=" << (rd_req_len + 1) << " id=" << rd_req_id;
       // Report how deep the outstanding-read queue actually gets: if it never exceeds 1,
       // any out-of-order or ID-demux test against this model is vacuous.
       if (rq_.size() > max_outstanding_) {

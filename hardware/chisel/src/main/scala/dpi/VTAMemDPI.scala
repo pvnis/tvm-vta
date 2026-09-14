@@ -113,6 +113,14 @@ class VTAMemDPIToAXI(debug: Boolean = true)(implicit val p: Parameters) extends 
     val dpi = new VTAMemDPIMaster
     val axi = new AXIClient(p(ShellKey).memParams)
   })
+  // Set VTA_TSIM_MULTI_RD=1 when generating the model to allow several reads to be in
+  // flight at once. The default path below issues one burst at a time, which means VME's
+  // tag array and ID-based response demultiplexing are never exercised in simulation - VTA
+  // only ever has one outstanding read with tag 0 - even though on hardware it can have up
+  // to RequestQueueDepth reads in flight across its clients.
+  val multiRd = sys.env.contains("VTA_TSIM_MULTI_RD")
+  if (multiRd) println("[VTAMemDPIToAXI] multiple outstanding reads ENABLED")
+
   //Read request interface for sw memory manager
   val ar_valid = RegInit(false.B)
   val ar_len = RegInit(0.U.asTypeOf(chiselTypeOf(io.dpi.req.ar_len)))
@@ -144,6 +152,7 @@ class VTAMemDPIToAXI(debug: Boolean = true)(implicit val p: Parameters) extends 
     counter := 0.U
   }
 
+  if (!multiRd) {
   switch(rstate){
     is(rIdle){
       when(dpiReqQueue.io.deq.valid && dpiReqQueue.io.deq.bits.len =/=0.U && counter === dpiDelay){
@@ -188,6 +197,35 @@ when(rstate === rIdle && dpiReqQueue.io.deq.valid){
   io.axi.r.bits.user := 0.U
   io.axi.r.bits.id := io.dpi.rd.bits.id
   io.dpi.rd.ready  := io.axi.r.ready
+  } else {
+    // Hand every queued AR to the DPI as it arrives rather than waiting for the previous
+    // burst to finish, so several reads with distinct tags are outstanding at once. Beats
+    // come back tagged with the id the memory model is serving, so r.last has to come from
+    // a per-id beat counter instead of the single ar_len register the in-order path uses.
+    val nIds = 1 << p(ShellKey).memParams.idBits
+    val beats = RegInit(VecInit(Seq.fill(nIds)(0.U((p(ShellKey).memParams.lenBits + 1).W))))
+    val issue = dpiReqQueue.io.deq.valid && (counter === dpiDelay)
+    dpiReqQueue.io.deq.ready := issue
+    io.dpi.req.ar_len   := dpiReqQueue.io.deq.bits.len
+    // Must be 0 unless actually issuing: the C++ model resolves rd_req_addr through the
+    // virtual memory manager whenever it is non-zero, WITHOUT checking rd_req_valid, so
+    // exposing the queue's output while it is empty aborts the simulation on a bogus
+    // address. The in-order path above never hit this because it drove a held register.
+    io.dpi.req.ar_addr  := Mux(issue, dpiReqQueue.io.deq.bits.addr, 0.U)
+    io.dpi.req.ar_id    := dpiReqQueue.io.deq.bits.id
+    io.dpi.req.ar_valid := issue
+    val rid = io.dpi.rd.bits.id
+    when (issue) { beats(dpiReqQueue.io.deq.bits.id) := dpiReqQueue.io.deq.bits.len + 1.U }
+    when (io.dpi.rd.valid && io.axi.r.ready) { beats(rid) := beats(rid) - 1.U }
+    io.axi.ar.ready    := dpiReqQueue.io.enq.ready
+    io.axi.r.valid     := io.dpi.rd.valid
+    io.axi.r.bits.data := io.dpi.rd.bits.data
+    io.axi.r.bits.last := io.dpi.rd.valid && (beats(rid) === 1.U)
+    io.axi.r.bits.resp := 0.U
+    io.axi.r.bits.user := 0.U
+    io.axi.r.bits.id   := io.dpi.rd.bits.id
+    io.dpi.rd.ready    := io.axi.r.ready
+  }
 
   //Write Request
   switch(wstate){
