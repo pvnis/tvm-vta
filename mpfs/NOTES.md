@@ -407,3 +407,59 @@ Libero run.
 Keep in mind when interpreting any future hardware result: every measurement taken after a
 program has wedged the device is worthless. Reset first (reset_board.sh), and treat only the
 first program after a reset as trustworthy.
+
+## Rebuilding with VTA at 100 MHz in its own clock domain (2026-09-14)
+
+Approach: VTA gets a dedicated PLL at 100 MHz and its two AXI ports cross back into the
+125 MHz FIC0 domain inside CoreAXI4Interconnect, which does the CDC itself when a port has
+CLOCK_DOMAIN_CROSSING enabled. FIC0, the MSS and the rest of the reference design are
+untouched and still run at 125 MHz.
+
+Why not simply retune a FIC clock, which would have been a one-line change:
+MSS_WRAPPER ANDs the lock outputs of all four MSS FIC DLLs into MSS_DLL_LOCKS
+(MSS_WRAPPER.tcl:676-680), and CLOCKS_AND_RESETS feeds that into the EXT_RST_N of every
+CORERESET (CLOCKS_AND_RESETS.tcl:100-102). So if any FIC DLL fails to lock at the new
+frequency, the ENTIRE fabric is held in reset - including the path we use to reach VTA. The
+MSS has no explicit FIC frequency setting to check against; it just locks a DLL to whatever
+the fabric supplies. Not worth the risk for a change that only needs to affect VTA.
+
+FIC_2 initially looked like a free ride - its AXI interface is explicitly marked unused
+(MPFS_DISCOVERY_KIT.tcl:185) and its 125 MHz clock drives nothing but a dead MSS port - but
+it is caught by the same DLL-lock AND, so retuning it carries exactly the same risk.
+
+This is the arrangement Microchip already uses for VectorBlox in this reference design
+(script_support/additional_configurations/Vectorblox): a second CCC, its own CORERESET, and
+a CoreAXI4Interconnect instance with MASTER0_CLOCK_DOMAIN_CROSSING:true as the bridge.
+
+Changes, all confined to the VTA integration:
+  VTA_CCC.tcl        new PLL, 50 MHz ref -> 100 MHz on GL0. Derived from Microchip's
+                     VectorBlox PF_CCC_C1 because that is a known-good 100 MHz config
+                     (1200 MHz VCO, GL0 divider 12, feedback 24). GL1-GL3 IS_USED false.
+  DMA_INITIATOR      MASTER1_CLOCK_DOMAIN_CROSSING true  (VTA's DMA master port)
+  FIC0_INITIATOR     SLAVE2_CLOCK_DOMAIN_CROSSING  true  (VTA's control port)
+  vta_integrate.tcl  instantiates VTA_CCC + a second CORERESET inside FIC_0_PERIPHERALS,
+                     drives VTA's ap_clk and both crossings' fabric-side clocks
+                     (DMA_INITIATOR:M_CLK1, FIC0_INITIATOR:S_CLK2) from the PLL, and brings
+                     the board's 50 MHz oscillator down from the top level as VTA_REF_CLK.
+  vta_clocks.sdc     declares the VTA and FIC0 clocks asynchronous, so the tools do not try
+                     to time through the CDC synchronizers.
+
+Tcl gotchas hit on the way, all of which cost a build iteration:
+  - GLx_0_OUT_FREQ:0 does NOT disable a CCC output; frequencies must be 1-1250 MHz. The
+    parameter is GLx_0_IS_USED, and the dividers (GLx_0_DIV) are explicit, so an arbitrary
+    frequency is not reachable from an arbitrary VCO - copy a known-good config instead.
+  - This CCC configuration exposes no PLL powerdown input, so CORERESET's PLL_POWERDOWN_B
+    has to be marked unused (VectorBlox does the same).
+  - After adding a port to a sub-design, the parent needs both a regenerate and an
+    sd_update_instance before the new port is visible; and a top-level port that is already
+    connected cannot be connected again - join the net by naming a pin already on it.
+  - derive_constraints_sdc needs build_design_hierarchy + set_root after the top component
+    is regenerated, and organize_tool_files only accepts files already imported into the
+    project (import_files, not create_links).
+  - MPFS_DISCOVERY_KIT_REFERENCE_DESIGN.tcl only OPENS an existing project (line 117), so a
+    leftover project silently rebuilds the previous design or fails with "a core already
+    exists". full_cycle.sh now removes the project first; iterate_integrate.sh keeps a
+    pristine base copy so the integration Tcl can be iterated without regenerating it.
+
+The previous working 125 MHz build (project + .ppd + timing report) is kept in
+../refdesign-vta-125mhz-backup, so the board can always be put back to a known state.
