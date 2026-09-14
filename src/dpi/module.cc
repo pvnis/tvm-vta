@@ -23,6 +23,7 @@
 #include <tvm/runtime/registry.h>
 
 #include <vta/dpi/module.h>
+#include <deque>
 #include <vta/dpi/tsim.h>
 #if defined(_WIN32)
 #include <windows.h>
@@ -141,11 +142,27 @@ class MemDevice {
   void WriteData(svOpenArrayHandle value, uint64_t wr_strb);
 
  private:
-  uint64_t* raddr_{0};
+  // Outstanding read requests. This used to be a single (addr, len, id) triple that each
+  // new request OVERWROTE, so the model could only ever have one read in flight and always
+  // returned bursts in the order issued. VTA's VME can have up to RequestQueueDepth reads
+  // outstanding across its clients and demultiplexes the responses by AXI ID (VME.scala,
+  // vmeTag_array), and a legal AXI4 slave may complete whole bursts out of order - none of
+  // which the old model could express, so that demux was never exercised in simulation.
+  struct ReadReq { uint64_t* addr; uint32_t len; uint32_t id; };
+  std::deque<ReadReq> rq_;
+  uint64_t serve_{0};
+  size_t max_outstanding_{0};
+  uint32_t ooo_{0};              // VTA_TSIM_RD_OOO: complete bursts out of order
+  bool ooo_init_{false};
   uint64_t* waddr_{0};
-  uint32_t rlen_{0};
-  uint32_t rid_{0};
   uint32_t wlen_{0};
+  // Optional read-response gaps. The model otherwise returns a beat on EVERY cycle a
+  // request is outstanding, which real DDR through an interconnect never does - so any
+  // logic that only misbehaves when beats arrive with gaps is invisible in TSIM. Set
+  // VTA_TSIM_RD_GAP=N to make only every Nth cycle deliver a beat.
+  uint32_t rd_gap_{0};
+  uint64_t rd_tick_{0};
+  bool rd_gap_init_{false};
   std::mutex mutex_;
   uint64_t dead_beef_ [8] = {0xdeadbeefdeadbeef,0xdeadbeefdeadbeef,
                               0xdeadbeefdeadbeef,0xdeadbeefdeadbeef,
@@ -217,9 +234,16 @@ void MemDevice::SetRequest(
   if(rd_req_addr !=0 ){
     void * rd_vaddr = vta::vmem::VirtualMemoryManager::Global()->GetAddr(rd_req_addr);
     if(rd_req_valid == 1) {
-      rlen_ = rd_req_len + 1;
-      rid_  = rd_req_id;
-      raddr_ = reinterpret_cast<uint64_t*>(rd_vaddr);
+      rq_.push_back(ReadReq{reinterpret_cast<uint64_t*>(rd_vaddr), rd_req_len + 1,
+                            rd_req_id});
+      // Report how deep the outstanding-read queue actually gets: if it never exceeds 1,
+      // any out-of-order or ID-demux test against this model is vacuous.
+      if (rq_.size() > max_outstanding_) {
+        max_outstanding_ = rq_.size();
+        LOG(INFO) << "TSIM memory: outstanding reads reached " << max_outstanding_
+                  << " (ids in flight:" << [&]{ std::string t; for (auto&q : rq_) t += " " +
+                     std::to_string(q.id); return t; }() << " )";
+      }
     }
   }
 
@@ -235,12 +259,42 @@ void MemDevice::SetRequest(
 MemResponse MemDevice::ReadData(uint8_t ready, int blkNb) {
   std::lock_guard<std::mutex> lock(mutex_);
   MemResponse r;
-  r.valid = rlen_ > 0;
-  r.value = rlen_ > 0 ? raddr_ : dead_beef_;
-  r.id    = rid_;
-  if (ready == 1 && rlen_ > 0) {
-    raddr_ += blkNb;
-    rlen_ -= 1;
+  if (!rd_gap_init_) {
+    const char* s = getenv("VTA_TSIM_RD_GAP");
+    rd_gap_ = (s && *s) ? static_cast<uint32_t>(strtoul(s, nullptr, 0)) : 0;
+    rd_gap_init_ = true;
+    if (rd_gap_) LOG(INFO) << "TSIM memory: a read beat every " << rd_gap_ << " cycles";
+  }
+  if (!ooo_init_) {
+    const char* s = getenv("VTA_TSIM_RD_OOO");
+    ooo_ = (s && *s) ? static_cast<uint32_t>(strtoul(s, nullptr, 0)) : 0;
+    ooo_init_ = true;
+    if (ooo_) LOG(INFO) << "TSIM memory: completing read bursts out of order";
+  }
+  if (rd_gap_ > 1 && (++rd_tick_ % rd_gap_) != 0) {
+    r.valid = 0;
+    r.value = dead_beef_;
+    r.id = 0;
+    return r;                    // stall this cycle: no beat
+  }
+  if (rq_.empty()) {
+    r.valid = 0;
+    r.value = dead_beef_;
+    r.id = 0;
+    return r;
+  }
+  // Pick which outstanding burst to serve. AXI4 forbids interleaving the beats of different
+  // transactions, so a burst is always completed in full once started; out-of-order mode
+  // only changes WHICH burst is served next, which AXI4 does allow.
+  size_t idx = 0;
+  if (ooo_ && rq_.size() > 1) idx = rq_.size() - 1;   // newest first
+  ReadReq& q = rq_[idx];
+  r.valid = 1;
+  r.value = q.addr;
+  r.id = q.id;
+  if (ready == 1) {
+    q.addr += blkNb;
+    if (--q.len == 0) rq_.erase(rq_.begin() + idx);
   }
   return r;
 }

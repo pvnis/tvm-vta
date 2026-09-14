@@ -660,3 +660,64 @@ record it as fixed. The next person should use wedge_stress.py (which now has an
 oracle) to re-establish a reproduction before trying anything, and should be suspicious of
 any fix "confirmed" by a few hundred clean iterations - the failure rate varies by at least
 two orders of magnitude between sessions.
+
+## #1 (GEMM zeros): hypotheses eliminated, and TSIM's coverage is much weaker than assumed
+
+Re-verified first: GEMM still returns all zeros on a freshly booted board with the alignment
+fix in place, and the output sentinel is overwritten, so the store happens and the MAC
+genuinely produces zero.
+
+Eliminated this session, cheaply and with evidence:
+
+  - Module concurrency. vta.build_config(debug_flag=32) = VTA_DEBUG_FORCE_SERIAL rewrites
+    the instruction dependencies so LOAD/COMPUTE/STORE never overlap. GEMM still returns
+    zeros, so the LOAD-vs-COMPUTE overlap that GEMM uniquely creates is NOT the cause.
+    (gemm_probe.py now takes VTA_DEBUG=<flags>.)
+  - A different instruction stream. Dumped both: TSIM executes
+    LOAD UOP / GEMM / LOAD INP / LOAD WGT / LOAD UOP / GEMM / STORE / NOP / NOP / FINISH,
+    identical to the driver's dump on hardware. Software is exonerated end to end - same
+    program, same addresses, correct data in DRAM, correct alignment.
+  - A different load implementation for inp/wgt vs acc. TensorLoad picks by
+    mp.dataBits >= tp.tensorSizeBits; at 64-bit bus, inp (128b), wgt (2048b) AND acc (512b)
+    all use TensorLoadNarrowVME. acc works, inp/wgt do not, but it is the same module.
+  - Gapped read beats. Added VTA_TSIM_RD_GAP to the DPI memory model so it delivers a beat
+    only every Nth cycle instead of every cycle. GEMM still passes in TSIM at gaps of 2 and 4.
+
+### The finding that matters: TSIM never tests the memory path VTA actually uses
+
+The DPI memory model held ONE outstanding read in a single (addr, len, id) triple that each
+new request overwrote. Extending it to a proper queue and instrumenting the depth shows
+what VTA does under TSIM:
+
+    TSIM memory: outstanding reads reached 1 (ids in flight: 0)
+
+One read at a time, tag 0, always. So VME's tag array and ID-based response demultiplexing
+(VME.scala:280-297) - the logic that decides which client each read response belongs to -
+has NO simulation coverage whatsoever, because the DPI shell serializes requests. On
+hardware VME can have up to RequestQueueDepth (16) reads in flight across fetch, load and
+compute clients, and demultiplexes them by AXI ID.
+
+Every earlier "the RTL is correct, TSIM passes" claim in these notes should be read with
+that caveat: TSIM validates the compute pipeline, not the memory interface.
+
+Relatedly, on VTA's DMA path the ID is truncated 9 -> 4 bits at the MSS boundary
+(MPFS_DISCOVERY_KIT.v: ARID_0_3to0 = ARID[3:0], and RID_0_8to4 forced to 5'h0), dropping the
+bit CoreAXI4Interconnect appends to identify which master issued the transaction. VTA's own
+tags are 0-15 so they survive, and whether the interconnect needs that bit for response
+routing (or tracks it internally) is not established - but it is the kind of thing that
+would break inp/wgt loads while leaving simpler traffic working.
+
+### Model improvements committed (src/dpi/module.cc)
+
+  - multiple outstanding reads (a deque instead of one overwritten triple)
+  - VTA_TSIM_RD_GAP=N   deliver a read beat only every Nth cycle
+  - VTA_TSIM_RD_OOO=1   complete whole bursts newest-first (legal AXI4: bursts may complete
+                        out of order, though beats of different transactions may not
+                        interleave)
+  - logs the maximum outstanding-read depth and the ids in flight
+
+With the shell as it is, RD_OOO is vacuous - the queue never exceeds one entry. Making it
+meaningful needs the Verilog side (VTAMemDPI.v and the VME-to-DPI adapter) to accept a new
+read request before the previous one completes. That is the next concrete step for #1: with
+it, the ID demux can be tested in simulation, and if it breaks there we have the hardware
+bug reproduced without an FPGA build.

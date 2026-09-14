@@ -47,8 +47,16 @@ s[y].pragma(s[y].op.axis[0], env.dma_copy)
 bo, co, bi, ci = s[y_gem].op.axis
 s[y_gem].reorder(ko, bo, co, bi, ci, ki)
 s[y_gem].tensorize(bi, env.gemm)
-with vta.build_config():
+# VTA_DEBUG selects runtime debug flags at build time (they are compiled into the module as
+# a VTASetDebugMode call). 32 = VTA_DEBUG_FORCE_SERIAL, which rewrites the instruction
+# dependencies so LOAD/COMPUTE/STORE never overlap - GEMM is the only test that makes the
+# LOAD module (inp/wgt) run concurrently with COMPUTE (uop/acc), so this tests directly
+# whether that concurrency is what breaks it.
+DEBUG_FLAG = int(os.environ.get("VTA_DEBUG", "0"), 0)
+with vta.build_config(debug_flag=DEBUG_FLAG):
     mod = vta.build(s, [x, w, y], tvm.target.Target("ext_dev", host=env.target_host))
+if DEBUG_FLAG:
+    print(f"[probe] debug_flag=0x{DEBUG_FLAG:x}")
 
 if env.TARGET in ("sim", "tsim"):
     from vta.testing import simulator
