@@ -71,7 +71,7 @@ static const size_t   kDefaultDmaSize = 64u << 20;    // 64 MiB
 // tensors, and the other VTA ports get page granularity for free because they
 // allocate through CMA or a page-based allocator; matching that keeps us clear of
 // any alignment requirement the runtime imposes on a buffer we hand back.
-static const size_t   kAlign          = 4096;         // DMA buffer alignment
+static const size_t   kAlign          = 64;           // DMA buffer alignment
 
 uint64_t EnvU64(const char* name, uint64_t dflt) {
   const char* s = getenv(name);
