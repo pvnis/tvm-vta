@@ -5,5 +5,5 @@
 # tools try to time through the synchronizers and spend placement effort on paths that are
 # false by construction.
 set_clock_groups -name {VTA_vs_FIC0} -asynchronous \
-    -group [ get_clocks { FIC_0_PERIPHERALS_0/VTA_CCC_0/pll_inst_0/OUT0 } ] \
+    -group [ get_clocks { FIC_0_PERIPHERALS_0/VTA_CCC_0/VTA_CCC_0/pll_inst_0/OUT0 } ] \
     -group [ get_clocks { CLOCKS_AND_RESETS_0/CCC_FIC_x_CLK/PF_CCC_C0_0/pll_inst_0/OUT0 } ]

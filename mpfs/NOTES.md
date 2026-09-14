@@ -463,3 +463,54 @@ Tcl gotchas hit on the way, all of which cost a build iteration:
 
 The previous working 125 MHz build (project + .ppd + timing report) is kept in
 ../refdesign-vta-125mhz-backup, so the board can always be put back to a known state.
+
+## The 100 MHz build is correct but the board will not boot with it (2026-09-14)
+
+Build results were excellent: VTA domain worst slack +1.670 ns at 100 MHz (16.7% of the
+period, against +0.056 ns at 125 MHz), FIC0 improved to +3.054 ns because VTA is no longer
+the critical path in that domain, no violations, resources exactly as expected (PLL 1->2,
+globals 9->10, uSRAM +33 for the CDC FIFOs, LSRAM 241 and Math 128 unchanged).
+Programming reported PROGRAM PASSED / Chain programming PASSED.
+
+But the board does not boot. HSS gets as far as
+
+    HSS: decompressing from eNVM to L2 Scratch ... Passed
+    wdog_service monitoring [u54_1] [u54_2] [u54_3] [u54_4]
+    beu_service :: [init] -> [monitoring]
+    Initializing Mi-V IHC V2          <- stops here, then watchdog-resets, repeatedly
+
+where a good boot continues "u54 State Change: [Idle]..." within 50 ms. JTAG is fine
+(reprogramming still passes), so the device is powered and alive - it is the design.
+
+What has been ruled out by diffing the two generated netlists as SETS of connections
+(ordering churn from regeneration makes a plain diff useless):
+  - Top level: the ONLY difference is the added .VTA_REF_CLK(REF_CLK_50MHz). MSS, FIC3,
+    CLOCKS_AND_RESETS and every other connection are identical.
+  - FIC_0_PERIPHERALS: the only differences are exactly the intended ones - VTA_CCC,
+    VTA_RESET and its constant ties, M_CLK1/S_CLK2 on the new clock, and VTA's ap_clk/
+    ap_rst_n moved to the new domain. Nothing unintended changed.
+  - No CCC placement, routing or clock-resource warnings in the build log.
+
+Why the hang looks like a clocking/reset problem rather than anything to do with VTA:
+Mi-V IHC is not on FIC0 at all - it lives in FIC_3_PERIPHERALS on the APB bus - so HSS is
+hanging on its first access to a FABRIC peripheral. FIC3's PRESETN comes from
+RESET_FIC_3_CLK, whose EXT_RST_N is the AND that includes MSS_DLL_LOCKS, which is the AND of
+all four MSS FIC DLL locks. If any FIC DLL fails to lock, every fabric peripheral stays in
+reset and the first access to one hangs the E51 until the watchdog fires - exactly the
+observed loop.
+
+The only thing the change touches outside FIC_0_PERIPHERALS is the REF_CLK_50MHz input pad,
+which now fans out to a second CCC instead of one. That is the leading suspect: it is the
+sole way this change could affect the main CCC and the FIC clocks derived from it.
+
+Next attempt: reference the VTA PLL from an existing clock global (e.g. FIC_0_CLK) instead
+of the REF_CLK pad, leaving the pad's dedicated route to the main CCC exactly as it was.
+The alternative suspect, if that does not fix it, is the CDC on FIC0_INITIATOR slave port 2
+stalling the interconnect while VTA's domain is still in reset - but HSS is not known to
+touch FIC0 during boot, so it explains the symptom less well.
+
+Recovery: the known-good 125 MHz project was restored from ../refdesign-vta-125mhz-backup.
+Libero refuses to program a project whose flow state is stale ("SYNTHESIZE Tool inputs are
+out of date"), and moving a project directory makes it stale, so restoring means re-running
+synthesis/P&R/programming-data even though the design is unchanged - budget for that.
+The 100 MHz project is kept as MPFS_DISCOVERY.100mhz.
