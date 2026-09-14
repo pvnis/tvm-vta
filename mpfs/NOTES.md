@@ -514,3 +514,47 @@ Libero refuses to program a project whose flow state is stale ("SYNTHESIZE Tool 
 out of date"), and moving a project directory makes it stale, so restoring means re-running
 synthesis/P&R/programming-data even though the design is unchanged - budget for that.
 The 100 MHz project is kept as MPFS_DISCOVERY.100mhz.
+
+## 100 MHz attempt 2: same hang, so the CLKINT/pad theory was WRONG
+
+v2 referenced VTA's PLL from FIC_0_CLK instead of the REF_CLK_50MHz pad. Verified before
+building: the top-level netlist was connectivity-IDENTICAL to the working design (the v1
+diff had shown the added VTA_REF_CLK; v2's diff is empty), no CLKINT_REF_CLK_50MHz in the
+timing report, and timing was even better than v1 - VTA +1.853 ns at 100 MHz, FIC0 +3.280 ns.
+The PLL config was DRC-validated in 90 seconds first (125 MHz / REFDIV 5 -> 25 MHz PFD,
+feedback 48 -> 1200 MHz VCO, GL0 divider 12; Libero derives multiply_by 4 divide_by 5).
+
+The board still does not boot, with exactly the same signature: HSS reaches
+"Initializing Mi-V IHC V2" and stops. So the reference-clock pad was not the cause, and the
+CLKINT was a red herring.
+
+What is left, all inside FIC_0_PERIPHERALS and common to both attempts:
+  1. a second fabric PLL (VTA_CCC) and a second CORERESET
+  2. CDC enabled on FIC0_INITIATOR slave 2 and DMA_INITIATOR master 1
+  3. VTA clocked at 100 MHz instead of ACLK
+
+Both attempts added a PLL that takes an existing critical clock as its reference (the pad in
+v1, FIC_0_CLK in v2). A CCC reference input is not an ordinary fabric load - it has to reach
+the CCC's dedicated input - so it is still the prime suspect, but that is now a hypothesis
+without evidence, and guessing has cost two build cycles.
+
+### Recovery is cheap if you COPY rather than MOVE
+
+Restoring the working project with `cp -a` (timestamps preserved) let Libero program it
+directly - about 3 minutes. Restoring by `mv` earlier made the flow stale
+("SYNTHESIZE Tool inputs are out of date") and forced a full 40-minute rebuild. Always keep
+a `cp -a` copy of a known-good project and restore it the same way.
+
+### Next: stop guessing, remove the PLL entirely
+
+The design has four existing clocks: FIC_0/1/2 at 125 MHz and FIC_3 at 50 MHz. None is
+100 MHz, so keeping 100 MHz REQUIRES a new PLL - the very thing under suspicion. Borrowing
+FIC_3_CLK (50 MHz) needs no PLL and no new CORERESET, just an extra fabric load on a global
+that is already routed, and FIC_3's MSS DLL is DISABLED (FIC_3_EMBEDDED_DLL_USED false), so
+perturbing that clock cannot break the MSS_DLL_LOCKS chain that gates every fabric reset.
+That makes it the safest clock in the design to borrow.
+
+50 MHz costs throughput but gives VTA a 20 ns period against the 8 ns it was failing at, and
+it is decisive either way: if the board boots and VTA behaves, the PLL was the problem and
+the timing hypothesis is confirmed; if it still hangs, the culprit is the interconnect CDC,
+which is the only remaining change.

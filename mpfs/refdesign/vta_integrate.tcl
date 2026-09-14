@@ -91,10 +91,14 @@ sd_update_instance -sd_name $sd -instance_name {FIC0_INITIATOR}
 source /home/dmd/polarfire_sandbox/refdesign-vta/script_support/additional_configurations/vta/DMA_INITIATOR.vta.tcl
 sd_update_instance -sd_name $sd -instance_name {DMA_INITIATOR}
 
-# 50 MHz reference for VTA's PLL, brought in from the top level.
-sd_create_scalar_port -sd_name $sd -port_name {VTA_REF_CLK} -port_direction {IN}
+# VTA's PLL is referenced from FIC_0_CLK, the clock this SmartDesign already runs on.
+# Do NOT reference the board's REF_CLK_50MHz pad instead: a second load on that pad makes
+# Libero insert a CLKINT global buffer, the main CCC loses its dedicated CCC_SW_CLKIN route,
+# and the reference path of every FIC clock changes. The first attempt did that and the
+# board stopped booting - HSS hung on its first fabric-peripheral access, which is what
+# MSS_DLL_LOCKS holding all the fabric resets looks like.
 sd_instantiate_component -sd_name $sd -component_name {VTA_CCC} -instance_name {VTA_CCC_0}
-sd_connect_pins -sd_name $sd -pin_names {"VTA_REF_CLK" "VTA_CCC_0:REF_CLK_0"}
+sd_connect_pins -sd_name $sd -pin_names {"ACLK" "VTA_CCC_0:REF_CLK_0"}
 
 # Reset synchronizer for the new domain. CORERESET already exists in this project (the
 # reference design instantiates one per FIC clock); this is another instance of it, held in
@@ -122,22 +126,10 @@ sd_connect_pins -sd_name $sd -pin_names {"VTA_CCC_0:OUT0_FABCLK_0" "VTA_0:ap_clk
     "DMA_INITIATOR:M_CLK1" "FIC0_INITIATOR:S_CLK2"}
 sd_connect_pins -sd_name $sd -pin_names {"VTA_RESET:FABRIC_RESET_N" "VTA_0:ap_rst_n"}
 save_smartdesign -sd_name $sd
-# Regenerate before touching the top level: until the hierarchy is rebuilt, the
-# FIC_0_PERIPHERALS_0 instance does not yet expose the VTA_REF_CLK port added above.
+# Nothing outside this SmartDesign changes now: VTA's PLL is referenced from ACLK, which
+# FIC_0_PERIPHERALS already receives, so the top level needs no new port or connection.
 build_design_hierarchy
 generate_component -component_name {FIC_0_PERIPHERALS} -recursive 1
-
-# Feed the board's 50 MHz oscillator to VTA's PLL.
-set top MPFS_DISCOVERY_KIT
-open_smartdesign -sd_name $top
-# Refresh the instance so it picks up the VTA_REF_CLK port added to FIC_0_PERIPHERALS.
-sd_update_instance -sd_name $top -instance_name {FIC_0_PERIPHERALS_0}
-# Join the existing REF_CLK_50MHz net by naming a pin already on it: the top-level port is
-# already driving CLOCKS_AND_RESETS, and connecting the port a second time is rejected.
-sd_connect_pins -sd_name $top -pin_names {"CLOCKS_AND_RESETS_0:REF_CLK_50MHz" "FIC_0_PERIPHERALS_0:VTA_REF_CLK"}
-save_smartdesign -sd_name $top
-
-build_design_hierarchy
 generate_component -component_name {MPFS_DISCOVERY_KIT} -recursive 1
 puts "VTA: integrated into $sd at 100 MHz (own PLL, CDC in the interconnects)"
 

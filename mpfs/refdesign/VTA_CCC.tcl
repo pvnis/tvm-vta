@@ -1,18 +1,20 @@
-# A dedicated PLL for the VTA accelerator: 50 MHz reference in, 100 MHz out on GL0.
+# A dedicated PLL for the VTA accelerator: 100 MHz out on GL0.
 #
 # VTA sits right on the edge at 125 MHz (post-layout worst slack +0.056 ns, and on hardware
 # the accelerator intermittently stopped completing programs), so it gets its own slower
 # clock and crosses into the 125 MHz FIC0 domain inside CoreAXI4Interconnect.
 #
-# Based on the PF_CCC_C1 that Microchip uses for VectorBlox in this same reference design,
-# because that is a known-good 100 MHz configuration from a 50 MHz reference (1200 MHz VCO,
-# GL0 divider 12, feedback 24). Only GL0 is kept; VectorBlox additionally used GL1 at
-# 200 MHz, which we do not need.
+# The reference is FIC_0_CLK (125 MHz), NOT the board's REF_CLK_50MHz input pad. Taking the
+# pad would add a second load to it, and Libero then inserts a CLKINT global buffer so the
+# MAIN CCC loses its dedicated CCC_SW_CLKIN route - which changes the reference path of every
+# FIC clock in the design. That is not theoretical: the first attempt did exactly this and
+# the board stopped booting, with HSS hanging on its first fabric-peripheral access because
+# MSS_DLL_LOCKS gates every fabric reset. Referencing an already-routed global leaves the
+# pad's dedicated path untouched.
 #
-# Deliberately a SEPARATE PLL rather than a change to any FIC clock: MSS_DLL_LOCKS ANDs the
-# lock outputs of all four MSS FIC DLLs and gates the reset release of every fabric domain,
-# so retuning a FIC clock risks holding the entire design in reset.
-# Create and Configure the core component VTA_CCC
+# Divider chain: 125 MHz / REFDIV 5 = 25 MHz phase detector, feedback 48 -> 1200 MHz VCO,
+# GL0 divider 12 -> 100 MHz (Libero derives this as multiply_by 4, divide_by 5).
+# Only GL0 is enabled.
 create_and_configure_core -core_vlnv {Actel:SgCore:PF_CCC:*} -component_name {VTA_CCC} -params {\
 "DLL_CLK_0_BANKCLK_EN:false"  \
 "DLL_CLK_0_DEDICATED_EN:false"  \
@@ -225,7 +227,7 @@ create_and_configure_core -core_vlnv {Actel:SgCore:PF_CCC:*} -component_name {VT
 "PLL_FB_CLK_1:GL0_1"  \
 "PLL_FEEDBACK_MODE_0:Post-VCO"  \
 "PLL_FEEDBACK_MODE_1:Post-VCO"  \
-"PLL_IN_FREQ_0:50"  \
+"PLL_IN_FREQ_0:125"  \
 "PLL_IN_FREQ_1:100"  \
 "PLL_INT_MODE_EN_0:false"  \
 "PLL_INT_MODE_EN_1:false"  \
@@ -238,7 +240,7 @@ create_and_configure_core -core_vlnv {Actel:SgCore:PF_CCC:*} -component_name {VT
 "PLL_POSTDIVIDERADDSOFTLOGIC_0:true"  \
 "PLL_REF_CLK_SEL_0:false"  \
 "PLL_REF_CLK_SEL_1:false"  \
-"PLL_REFDIV_0:1"  \
+"PLL_REFDIV_0:5"  \
 "PLL_REFDIV_1:1"  \
 "PLL_SPREAD_MODE_0:false"  \
 "PLL_SPREAD_MODE_1:false"  \
