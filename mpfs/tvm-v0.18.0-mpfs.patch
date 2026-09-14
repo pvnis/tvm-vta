@@ -1,0 +1,69 @@
+diff --git a/cmake/modules/VTA.cmake b/cmake/modules/VTA.cmake
+index f3fd473..e4c606e 100644
+--- a/cmake/modules/VTA.cmake
++++ b/cmake/modules/VTA.cmake
+@@ -116,6 +116,15 @@ elseif(PYTHON)
+     elseif(${VTA_TARGET} STREQUAL "de10nano")  # DE10-Nano rules
+       tvm_file_glob(GLOB DE10_FPGA_RUNTIME_SRCS ${VTA_HW_PATH}/src/de10nano/*.cc ${VTA_HW_PATH}/src/*.cc)
+       list(APPEND FPGA_RUNTIME_SRCS ${DE10_FPGA_RUNTIME_SRCS})
++    elseif(${VTA_TARGET} STREQUAL "mpfs")  # Microchip PolarFire SoC rules
++      tvm_file_glob(GLOB MPFS_FPGA_RUNTIME_SRCS ${VTA_HW_PATH}/src/mpfs/*.cc ${VTA_HW_PATH}/src/*.cc)
++      list(APPEND FPGA_RUNTIME_SRCS ${MPFS_FPGA_RUNTIME_SRCS})
++      # The uop and insn queues each reserve VTA_MAX_XFER bytes up front. The stock
++      # 32 MB would consume the whole 64 MB non-cached DMA pool on its own, leaving
++      # nothing for tensors; 4 MB is far more than any single kernel needs (the
++      # on-chip uop buffer is 32 KB) and the runtime flushes the insn queue when full.
++      # (leading space: the loops below strip the first 3 characters, " -D")
++      list(APPEND VTA_DEFINITIONS " -DVTA_MAX_XFER=4194304")
+     elseif(${VTA_TARGET} STREQUAL "intelfocl")  # Intel OpenCL for FPGA rules
+       tvm_file_glob(GLOB FOCL_SRC ${VTA_HW_PATH}/src/oclfpga/*.cc)
+       list(APPEND FPGA_RUNTIME_SRCS ${FOCL_SRC})
+diff --git a/vta/python/vta/environment.py b/vta/python/vta/environment.py
+index 087c7e8..26458da 100644
+--- a/vta/python/vta/environment.py
++++ b/vta/python/vta/environment.py
+@@ -25,6 +25,14 @@ import tvm
+ from tvm import te
+ from . import intrin
+ 
++# LLVM target for the PolarFire SoC's U54 application cores. The ISA string and the
++# ABI must both be pinned: Ubuntu's riscv64 GCC defaults to RVA23, whose vector code
++# SIGILLs on this rv64gc part, and LLVM otherwise emits soft-float-ABI objects that
++# the (lp64d) cross linker refuses to merge with the rootfs libraries.
++MPFS_LLVM_TARGET = (
++    "llvm -mtriple=riscv64-unknown-linux-gnu -mattr=+m,+a,+f,+d,+c -mabi=lp64d"
++)
++
+ 
+ def get_vta_hw_path():
+     """Get the VTA HW path."""
+@@ -234,12 +242,16 @@ class Environment(object):
+             return "llvm -mtriple=armv7-none-linux-gnueabihf"
+         if self.TARGET == "ultra96":
+             return "llvm -mtriple=aarch64-linux-gnu"
++        if self.TARGET == "mpfs":
++            return MPFS_LLVM_TARGET
+         if self.TARGET in ["sim", "tsim", "intelfocl"]:
+             return "llvm"
+         raise ValueError("Unknown target %s" % self.TARGET)
+ 
+     @property
+     def target_vta_cpu(self):
++        if self.TARGET == "mpfs":
++            return tvm.target.Target(MPFS_LLVM_TARGET)
+         return tvm.target.arm_cpu(model=self.TARGET)
+ 
+ 
+diff --git a/vta/python/vta/testing/utils.py b/vta/python/vta/testing/utils.py
+index f163359..8392e46 100644
+--- a/vta/python/vta/testing/utils.py
++++ b/vta/python/vta/testing/utils.py
+@@ -52,7 +52,7 @@ def run(run_func):
+                 assert simulator.enabled()
+             run_func(env, rpc.LocalSession())
+ 
+-    elif env.TARGET in ["pynq", "ultra96", "de10nano"]:
++    elif env.TARGET in ["pynq", "ultra96", "de10nano", "mpfs"]:
+         # The environment variables below should be set if we are using
+         # a tracker to obtain a remote for a test device
+         tracker_host = os.environ.get("TVM_TRACKER_HOST", None)
