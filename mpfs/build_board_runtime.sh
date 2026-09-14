@@ -19,7 +19,17 @@ target=$(grep -o 'Build VTA runtime with target: .*' cmake_build.log | tail -1 |
 ninja vta tvm_runtime tvm_rpc
 
 echo "== deploying to $BOARD =="
-ssh -n "$BOARD" 'pkill -f "[t]vm_rpc" || true'
+# The server runs as vta-rpc.service. Stop it (and any stray copy) before overwriting the
+# libraries, then let systemd start it again: a stray nohup'd server left holding port 9091
+# makes the restarted one silently fall back to 9092, and the host then talks to whichever
+# stale binary owns 9091.
+ssh -n "$BOARD" 'systemctl stop vta-rpc 2>/dev/null; pkill -9 -f "[t]vm_rpc" || true; sleep 1'
 scp libvta.so libtvm_runtime.so "$BOARD:/root/vta-board/lib/"
 scp tvm_rpc "$BOARD:/root/vta-board/"
-ssh -n "$BOARD" 'rm -f /root/vta-board/rpc.log; nohup /root/vta-board/start_rpc_server.sh 9091 > /root/vta-board/rpc.log 2>&1 & sleep 3; grep -q "bind to" /root/vta-board/rpc.log && echo "rpc server up" || cat /root/vta-board/rpc.log'
+ssh -n "$BOARD" 'systemctl start vta-rpc; sleep 3
+    port=$(journalctl -u vta-rpc --no-pager -n 20 | grep -o "bind to 0.0.0.0:[0-9]*" | tail -1)
+    case "$port" in
+        *9091) echo "rpc server up on 9091" ;;
+        "")    echo "!! rpc server did not report a bind"; exit 1 ;;
+        *)     echo "!! rpc server came up on the wrong port: $port"; exit 1 ;;
+    esac'

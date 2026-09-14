@@ -63,7 +63,26 @@ f = remote.load_module("gemm_probe.so")
 dev = remote.ext_dev(0)
 
 rng = np.random.default_rng(3)
-if mode == "identity":
+if mode == "diag":
+    # One program that separates the three permutations the identity test cannot tell
+    # apart. Batch tile 0 carries distinct input values, batch tile 1 uniform ones;
+    # weight tile 0 has identical rows, weight tile 1 has a distinct value per row. So:
+    #   out[batch=0, wgt=0, c]  is blind to a wgt ROW permutation (rows are identical)
+    #                           -> all 1s if correct; all 9s if inp (or the wgt k-axis)
+    #                              is rotated by 8.
+    #   out[batch=1, wgt=1, c]  is blind to an inp permutation (input is uniform)
+    #                           -> c+1 if correct; permuted if the wgt ROWS are rotated.
+    assert o >= 2 and m >= 2
+    x_np = np.zeros((o, red, env.BATCH, env.BLOCK_IN), dtype=x.dtype)
+    for j in range(red):
+        x_np[0, j, 0, :] = np.arange(1, env.BLOCK_IN + 1, dtype=x.dtype)  # distinct
+        x_np[1, j, 0, :] = 1                                              # uniform
+    w_np = np.zeros((m, red, env.BLOCK_OUT, env.BLOCK_IN), dtype=w.dtype)
+    for j in range(red):
+        for c in range(env.BLOCK_OUT):
+            w_np[0, j, c, 0] = 1        # every row identical: selects input channel 0
+            w_np[1, j, c, 0] = c + 1    # row c scaled by c+1
+elif mode == "identity":
     # x holds a distinct small value per input channel; w is one-hot, so each output
     # channel simply selects one input channel. Any permutation/addressing error in the
     # inp or wgt load shows up directly as the wrong channel being picked.

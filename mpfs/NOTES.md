@@ -312,3 +312,60 @@ Driver improvement worth making: VTADeviceRun polls `wait_cycles` times and only
 LOG(FATAL)s. With the counts TVM passes, that is minutes of spinning and it presents as a
 hang. It should use a wall-clock deadline and return an error, so a wedged device is
 reported instead of blocking the RPC server.
+
+## RETRACTION of the beat-ordering claim, and a real bug found (2026-09-14, later)
+
+The "two 64-bit halves are swapped" finding above is WRONG. It was an artifact of a genuine
+software bug that was corrupting the weight address, so the GEMM was multiplying by whatever
+happened to be in the output buffer. Retained above only because the reasoning chain is
+worth seeing; the conclusion is retracted.
+
+### The real bug: VTA addresses DRAM in tensor elements, so buffers must be element-aligned
+
+A load/store instruction's `dram_base` does not count bytes. It counts ELEMENTS of the
+buffer's tensor type, and the runtime forms it by dividing the physical address by that
+element size. At this configuration:
+
+    wgt element = BLOCK_OUT * BLOCK_IN * WGT_WIDTH/8 = 256 bytes
+    acc element = BATCH * BLOCK_OUT * ACC_WIDTH/8    =  64 bytes
+    inp element = BATCH * BLOCK_IN  * INP_WIDTH/8    =  16 bytes
+    out element = BATCH * BLOCK_OUT * INP_WIDTH/8    =  16 bytes
+    uop element                                      =   4 bytes
+
+A buffer not aligned to its own element size has the remainder silently truncated. Our
+allocator aligned to 64 bytes, so a 512-byte weight buffer landed at ...0080 and the wgt
+load addressed ...0000 - the OUTPUT buffer. Nothing warns; VTA just reads the wrong place.
+
+This is exactly why ALU and padded-load passed while GEMM did not: those only use acc
+(64-byte elements) and out (16-byte), both satisfied by 64-byte alignment. GEMM is the only
+test that needs a wgt tensor. The other VTA ports never hit this because they allocate whole
+pages through CMA.
+
+Fixed by deriving the alignment from the VTA config (max element size, 256 here) instead of
+a hardcoded 64. The driver cannot know which tensor a buffer will hold, so it has to align
+every allocation to the largest element size.
+
+How it was found: an env-gated instruction dump in the driver (VTA_MPFS_DEBUG=1) that prints
+each load/store's dram_base converted back to a byte address, next to a log of every
+allocation's physical address. Comparing the two columns made it obvious in one run. Worth
+keeping - it is the only way to see what VTA was actually told to do.
+
+### State after the fix
+
+Addresses are now correct and verified independently: the wgt instruction points at
+0xC4000200, and reading that DRAM from a separate process via devmem2 shows exactly the
+one-hot pattern the host wrote (0x01 at byte c*16+c). So the entire software path - buffer
+contents, physical addresses, instruction encoding - is confirmed good.
+
+GEMM nevertheless still returns all zeros on a freshly reset device, while ALU and padded
+load pass. So there is a second, independent fault, and it is in hardware: VTA is told the
+right address, the right data is at that address, and the result is still zero. The earlier
+eliminations still stand (schedule correct in FSIM, RTL correct in TSIM against a
+byte-identical netlist, timing met and fully constrained, DMA volume scales correctly), and
+the remaining uncovered surface is still the XilinxShell AXI bridge, which TSIM replaces
+with a DPI memory model.
+
+Also fixed: build_board_runtime.sh was starting its own nohup'd server, which fought with
+vta-rpc.service for port 9091 - the loser silently binds 9092, so the host keeps talking to
+a stale binary and tests appear not to respond to code changes. It now goes through
+systemctl and asserts the server came up on 9091.
