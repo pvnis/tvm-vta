@@ -608,3 +608,55 @@ exactly as VectorBlox does.
 Three full build+program cycles (~1 h each) to eliminate two wrong theories and land on the
 right suspect. Recovery is now cheap (cp -a the known-good project, program, ~3 min), and
 MPFS_DISCOVERY.{100mhz,100mhz.v2,50mhz} are kept for comparison.
+
+## #3 done (timeout + diagnostics); #2 investigated, NOT fixed (2026-09-14)
+
+### Delivered: VTADeviceRun no longer hangs
+
+It waited on the caller's spin count, which TVM sets huge, so a device that never reported
+completion blocked for minutes and looked like a hang. It now uses a wall-clock deadline
+(VTA_MPFS_TIMEOUT_MS, default 10 s), spins briefly for short programs then backs off with a
+200 us sleep (polling the control register is itself AXI traffic competing with VTA's DMA),
+and on expiry dumps the whole register window plus the cycle count before/after, then
+returns 1. runtime.cc does CHECK_EQ(timeout, 0), so that surfaces as a clean error on the
+host instead of a hang. Verified: it fired correctly on every wedge observed.
+
+### What the wedge actually looks like
+
+With the timeout in place, at the moment of failure:
+    regs: 0x00=0x00000001 0x04=0x00000271 0x08=0x00000007 0x0c=0xc4400c00 0x10..0x20=0
+ctrl bit0 (launch) still set, bit1 (finish) never set; insn count and address correct; and
+the cycle count UNCHANGED from before the launch. Since the VCR only latches that register
+when the core pulses its event count at the end of a run, the core never reported a
+completion - it did not execute that run at all. The wedge is sticky: every subsequent run
+fails until the fabric is reset.
+
+### A wrong conclusion, and the flaw that produced it
+
+I briefly concluded "the program completes and only the finish handshake is lost", because
+the output buffer held the correct result after a failed run. That was an artifact of the
+test: it ran the SAME program with the SAME inputs every iteration, so the buffer still held
+the previous run's correct output. wedge_stress.py now varies the input each iteration and
+pre-fills the output with a sentinel, which distinguishes "ran" from "never started". The
+cycle-count evidence above contradicts the original claim and is the one to trust.
+
+### No validated fix - and the attempts that looked like one
+
+  - Adding a device read before the launch write: first looked decisive (1500 clean after
+    failures at 2-6). Then it failed at iteration 166, and a controlled A/B under the same
+    harness showed the SAME behaviour with and without it. Not a fix.
+  - "fence iorw,iorw" instead of __sync_synchronize(): does not fix it either (failed at
+    iteration 10 in testing). Kept anyway, because MMIO ordering on RISC-V genuinely needs
+    the I/O bits and "fence rw,rw" does not set them - but it is correctness hygiene, not a
+    remedy.
+
+The wedge then stopped reproducing entirely: 16,000+ consecutive executions clean across
+both driver variants and both harnesses, where it previously failed within 2-6 runs. Die
+temperature was 63.6 C during the clean runs versus 62.8 C during the failing ones, so
+thermal drift does not explain it either. The variable that changed is not identified.
+
+State: real, observed many times, sticky, currently not reproducible, cause unknown. Do not
+record it as fixed. The next person should use wedge_stress.py (which now has an honest
+oracle) to re-establish a reproduction before trying anything, and should be suspicious of
+any fix "confirmed" by a few hundred clean iterations - the failure rate varies by at least
+two orders of magnitude between sessions.

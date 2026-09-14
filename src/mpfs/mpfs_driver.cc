@@ -42,11 +42,14 @@
 
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <cstdint>
 #include <cstdlib>
+#include <cstdio>
 #include <cstring>
+#include <string>
 #include <ios>
 #include <mutex>
 #include <utility>
@@ -68,10 +71,6 @@ static const uint64_t kDefaultRegBase = 0x60020000;   // FIC0 interconnect slave
 static const size_t   kDefaultRegSize = 0x10000;      // 64 KB window
 static const uint64_t kDefaultDmaBase = 0xC4000000;   // non-cached-low-buffer (no-map)
 static const size_t   kDefaultDmaSize = 64u << 20;    // 64 MiB
-// Page alignment for every buffer. TVM asks for up to 256-byte alignment on VTA
-// tensors, and the other VTA ports get page granularity for free because they
-// allocate through CMA or a page-based allocator; matching that keeps us clear of
-// any alignment requirement the runtime imposes on a buffer we hand back.
 // VTA addresses DRAM in units of TENSOR ELEMENTS, not bytes: a load/store instruction's
 // dram_base counts elements whose size depends on which buffer it refers to (at this
 // configuration 256 bytes for a wgt tensor, 64 for acc, 16 for inp and out, 4 for uop).
@@ -96,6 +95,30 @@ constexpr size_t MaxOf(size_t a, size_t b) { return a > b ? a : b; }
 static const size_t kAlign =
     MaxOf(64, MaxOf(MaxOf(kWgtElemBytes, kAccElemBytes),
                     MaxOf(kInpElemBytes, kOutElemBytes)));
+
+static const uint64_t kDefaultTimeoutMs = 10000;   // generous: real programs take ms
+
+uint64_t MonotonicMs() {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return static_cast<uint64_t>(ts.tv_sec) * 1000 + ts.tv_nsec / 1000000;
+}
+
+/*!
+ * \brief Ordering barrier for memory-mapped device accesses.
+ *
+ * __sync_synchronize() emits "fence rw,rw" on RISC-V, which orders normal memory but NOT
+ * device I/O - RISC-V keeps separate ordering bits for I/O, so MMIO needs the "io" bits
+ * too. Without this, VTA's launch write can overtake the instruction-count and
+ * instruction-address writes that configure the run.
+ */
+static inline void IoBarrier() {
+#if defined(__riscv)
+  __asm__ __volatile__("fence iorw,iorw" ::: "memory");
+#else
+  __sync_synchronize();
+#endif
+}
 
 uint64_t EnvU64(const char* name, uint64_t dflt) {
   const char* s = getenv(name);
@@ -320,16 +343,63 @@ int VTADeviceRun(VTADeviceHandle handle, vta_phy_addr_t insn_phy_addr, uint32_t 
   dev->WriteReg(kRegInsnCount, insn_count);
   dev->WriteReg(kRegInsnAddr, static_cast<uint32_t>(insn_phy_addr));
   for (uint32_t off = kRegPtrFirst; off <= kRegPtrLast; off += 4) dev->WriteReg(off, 0);
-  __sync_synchronize();          // instruction/data writes must land before launch
+  // The VCR latches the cycle count from a separate event-count pulse from the core
+  // (VCR.scala, io.vcr.ecnt) than the one that sets 'finish'. Sampling it before the launch
+  // gives a second, independent indication that the run completed.
+  // Sample the cycle count before launching. The VCR latches it from a separate event-count
+  // pulse than the one that sets 'finish' (VCR.scala, io.vcr.ecnt), so comparing it after a
+  // timeout says whether the core reported a completion at all.
+  //
+  // NOT a validated fix for the intermittent wedge: reading a register here appeared to help
+  // at first, but a controlled A/B showed the same behaviour without it, and the wedge has
+  // not reproduced since regardless. Keep it for the diagnostic value, not as a remedy.
+  const uint32_t cyc_before = dev->ReadReg(kRegCycles);
+  IoBarrier();                   // configuration writes must land before the launch
   dev->WriteReg(kRegCtrl, kCtrlLaunch);
 
-  for (uint32_t i = 0; i < wait_cycles; ++i) {
+  // Wait on a wall-clock deadline rather than the caller's spin count. wait_cycles is a
+  // poll count with no relation to how long the accelerator actually needs, and TVM passes
+  // a huge one, so a device that never raises 'finish' used to spin for minutes and present
+  // as a hang instead of an error. Override with VTA_MPFS_TIMEOUT_MS.
+  (void)wait_cycles;
+  const uint64_t timeout_ms = EnvU64("VTA_MPFS_TIMEOUT_MS", kDefaultTimeoutMs);
+  const uint64_t t0 = MonotonicMs();
+  uint64_t polls = 0;
+  while (true) {
     if (dev->ReadReg(kRegCtrl) & kCtrlFinish) {
       __sync_synchronize();      // results are visible before we return
       return 0;
     }
+    ++polls;
+    // Spin briefly so short programs finish at full speed, then back off: polling the
+    // control register is itself AXI traffic competing with VTA's own DMA.
+    if (polls > 2000) {
+      struct timespec ts = {0, 200 * 1000};  // 200 us
+      nanosleep(&ts, nullptr);
+    }
+    if (MonotonicMs() - t0 >= timeout_ms) break;
   }
-  LOG(FATAL) << "VTA: timed out after " << wait_cycles << " polls waiting for completion "
-             << "(insn_count=" << insn_count << ")";
+
+  // Dump the whole register window. Note 0x04 is NOT a live counter: the VCR only latches
+  // it when the core pulses its event count at the end of a run (VCR.scala, io.vcr.ecnt),
+  // so it holds the LAST COMPLETED run's cycle count and says nothing about what the core
+  // is doing now. ctrl bit0 is launch (a level, cleared by the core asserting finish) and
+  // bit1 is finish, so ctrl==0x1 means our launch is still standing and the core has not
+  // completed.
+  std::string regs;
+  char buf[32];
+  for (uint32_t off = 0; off <= kRegPtrLast; off += 4) {
+    snprintf(buf, sizeof(buf), "%s0x%02x=0x%08x", off ? " " : "", off, dev->ReadReg(off));
+    regs += buf;
+  }
+  const uint32_t cyc_after = dev->ReadReg(kRegCycles);
+  LOG(ERROR) << "VTA: no completion after " << timeout_ms << " ms (insn_count=" << insn_count
+             << ", insn at 0x" << std::hex << insn_phy_addr << std::dec << "). cycles "
+             << cyc_before << " -> " << cyc_after
+             << (cyc_after != cyc_before
+                     ? "  <-- CHANGED: the core did finish and reported its cycle count, so"
+                       " only the 'finish' bit in the control register was lost"
+                     : "  (unchanged: no completion reported at all)")
+             << ". regs: " << regs;
   return 1;
 }

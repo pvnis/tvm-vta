@@ -99,7 +99,10 @@ else:
     x_np = rng.integers(-2, 2, size=(o, red, env.BATCH, env.BLOCK_IN)).astype(x.dtype)
     w_np = rng.integers(-2, 2, size=(m, red, env.BLOCK_OUT, env.BLOCK_IN)).astype(w.dtype)
 
-y_nd = tvm.nd.array(np.zeros((o, m, env.BATCH, env.BLOCK_OUT), dtype=y.dtype), dev)
+# Pre-fill the output with a sentinel rather than zeros: that distinguishes "VTA stored a
+# computed zero" from "VTA never stored anything at all", which zeros cannot.
+SENTINEL = 77
+y_nd = tvm.nd.array(np.full((o, m, env.BATCH, env.BLOCK_OUT), SENTINEL, dtype=y.dtype), dev)
 f(tvm.nd.array(x_np, dev), tvm.nd.array(w_np, dev), y_nd)
 got = y_nd.numpy()
 
@@ -115,7 +118,7 @@ if env.TARGET in ("sim", "tsim"):
     # if the board is much faster, its DMA reads never happened.
     print(f"[probe] stats={dict(simulator.stats())}")
 print(f"[probe] TARGET={env.TARGET} mode={mode} red={red} correct={(got==ref).sum()}/{got.size}")
-print(f"[probe] got  zeros={(got==0).sum()}  ref zeros={(ref==0).sum()}")
+print(f"[probe] got  zeros={(got==0).sum()}  still_sentinel={(got==SENTINEL).sum()}  ref zeros={(ref==0).sum()}")
 for b in range(o):
     for i in range(m):
         same = np.array_equal(got[b, i, 0], ref[b, i, 0])
