@@ -936,3 +936,49 @@ Redo it that way, then VTA can run at 100 MHz (or 50) with the margin it needs.
 Do NOT trust any hardware measurement that was not taken on a freshly REPROGRAMMED fabric.
 reprogram_board.sh does that and waits for the board; reset_board.sh (Linux reboot) does not
 reset the fabric and is not sufficient.
+
+## The dedicated-bridge topology is blocked too (2026-09-15)
+
+Built the VectorBlox arrangement: two 1x1 CoreAXI4Interconnect instances as dedicated CDC
+bridges (VTA_DMA_BRIDGE, VTA_CTRL_BRIDGE), with CLOCK_DOMAIN_CROSSING reverted to false on
+FIC0_INITIATOR and DMA_INITIATOR so the shared system interconnects stay single-clock.
+
+The DMA-side bridge configures and connects without trouble. The CONTROL side does not:
+SmartDesign rejects FIC0_INITIATOR:AXI4mslave2 <-> VTA_CTRL_BRIDGE_0:AXI4mmaster0 as "not
+compatible", and it survived every fix:
+
+  - the core caps ID_WIDTH at 8 (9, 10, 12 and 16 are all rejected as illegal), while
+    FIC0_INITIATOR's slave ports emit ID_WIDTH + NUM_MASTERS_WIDTH = 9 bits;
+  - setting FIC0_INITIATOR's NUM_MASTERS_WIDTH to 0 (legitimate - it has NUM_MASTERS:1) does
+    bring its ARID down to 8 bits, and then the signal sets and widths match exactly
+    (ARADDR 38, ARID 8, ARLEN 8, ARUSER 1, WDATA 32);
+  - an AXI4Lite (TYPE:1) port on the bridge's master side has NO ID signals at all while
+    FIC0_INITIATOR's Lite slave port DOES, so the types were matched as full AXI4 (TYPE:0)
+    on both sides.
+
+Widths, signal sets and types all agree and it is still refused. Cause not identified.
+
+Also worth knowing: generating a component into MPFS_DISCOVERY.base (the pristine copy that
+iterate_integrate.sh restores from) poisons every later run with "the folder ... already
+exists". Keep the base copy clean.
+
+The design is left in the known-good topology - VTA connected directly to both interconnects
+and clocked from ACLK at 125 MHz - and integration verified to run clean end to end. The
+bridge configs are kept in script_support/additional_configurations/vta/ for whoever picks
+this up.
+
+### Recommendation: stop trying to lower the clock, re-time the RTL instead
+
+Four attempts at giving VTA its own clock have now failed at the Libero integration level,
+for three different reasons. The goal was only ever more timing margin. That can be had
+without touching the integration at all, by pipelining VTA's critical path so 125 MHz closes
+comfortably:
+
+  - the remaining critical path is known and internal to VTA:
+    compute/loadUop/tensorLoad/vmeCmd/decR -> cmdGen/rdCmdStartIdx, ~30 logic levels,
+    +0.056 ns slack;
+  - it is our own Chisel, so it can be changed and validated in TSIM before any FPGA build;
+  - the design stays single-clock: no CDC, no interconnect changes, no boot risk, and none
+    of the three failure modes hit so far can recur.
+
+That is the next thing to try.

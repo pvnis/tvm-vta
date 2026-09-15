@@ -74,12 +74,6 @@ hdl_core_add_bif -hdl_core_name {XilinxShell} -bif_definition {AXI4:AMBA:AMBA4:s
 "RRESP:s_axi_control_RRESP" }
 
 
-# VTA does not run on FIC_0_CLK. At 125 MHz the post-layout worst slack was +0.056 ns -
-# 0.7% of the period - and on hardware the accelerator intermittently stopped completing
-# programs, so it is given margin instead. Its two AXI ports cross back into the 125 MHz
-# FIC0 domain inside CoreAXI4Interconnect, which does the CDC itself when a port has
-# CLOCK_DOMAIN_CROSSING enabled (the arrangement Microchip uses for VectorBlox here).
-
 set sd FIC_0_PERIPHERALS
 open_smartdesign -sd_name $sd
 source /home/dmd/polarfire_sandbox/refdesign-vta/script_support/additional_configurations/vta/FIC0_INITIATOR.vta.tcl
@@ -87,52 +81,33 @@ sd_update_instance -sd_name $sd -instance_name {FIC0_INITIATOR}
 source /home/dmd/polarfire_sandbox/refdesign-vta/script_support/additional_configurations/vta/DMA_INITIATOR.vta.tcl
 sd_update_instance -sd_name $sd -instance_name {DMA_INITIATOR}
 
-# VTA runs on FIC_3_CLK (50 MHz), borrowed from the existing clock tree - NO new PLL.
+# VTA is connected directly to the two system interconnects and runs on ACLK (FIC_0_CLK,
+# 125 MHz) - the topology of the known-good build.
 #
-# Two attempts at 100 MHz with a dedicated PLL both left the board unbootable, HSS hanging on
-# its first fabric-peripheral access (Mi-V IHC, which is on FIC3). The second attempt was
-# connectivity-identical to the working design at the top level and still failed, so the
-# cause is inside this SmartDesign, and a fabric PLL referenced from an existing critical
-# clock is the common factor. The design has no 100 MHz clock to borrow, so keeping 100 MHz
-# would mean keeping the suspect; 50 MHz still gives VTA a 20 ns period against the 8 ns it
-# was failing at.
-#
-# FIC_3_CLK is the safest clock in the design to borrow: its MSS DLL is DISABLED
-# (FIC_3_EMBEDDED_DLL_USED false), so adding fabric loads to it cannot break the
-# MSS_DLL_LOCKS chain that gates the reset of every fabric peripheral.
-sd_create_scalar_port -sd_name $sd -port_name {VTA_CLK} -port_direction {IN}
-sd_create_scalar_port -sd_name $sd -port_name {VTA_ARESETN} -port_direction {IN}
-
+# Giving VTA a slower clock is still the right fix for the timing marginality, but every
+# route tried so far is blocked: enabling CLOCK_DOMAIN_CROSSING on ports of the SHARED
+# interconnects makes the board unbootable (three attempts, three different clock sources),
+# and moving the crossing into dedicated 1x1 bridges - Microchip's own VectorBlox topology -
+# fails at the control path, where SmartDesign rejects the connection between
+# FIC0_INITIATOR:AXI4mslave2 and the bridge's slave interface as "not compatible" even with
+# the signal sets, widths (ARADDR 38, ARID 8, ARLEN 8, ARUSER 1) and AXI4 types all matched.
+# The DMA-side bridge configures and connects fine; it is the control path that blocks.
 sd_instantiate_hdl_core -sd_name $sd -hdl_core_name {XilinxShell} -instance_name {VTA_0}
 sd_connect_pins -sd_name $sd -pin_names {"FIC0_INITIATOR:AXI4mslave2" "VTA_0:s_axi_control"}
 sd_connect_pins -sd_name $sd -pin_names {"VTA_0:m_axi_gmem" "DMA_INITIATOR:AXI4mmaster1"}
-# VTA and the fabric-facing side of both crossings run on the borrowed clock; the
-# interconnects' own ACLK stays on FIC_0_CLK at 125 MHz.
-sd_connect_pins -sd_name $sd -pin_names {"VTA_CLK" "VTA_0:ap_clk" \
-    "DMA_INITIATOR:M_CLK1" "FIC0_INITIATOR:S_CLK2"}
-sd_connect_pins -sd_name $sd -pin_names {"VTA_ARESETN" "VTA_0:ap_rst_n"}
+sd_connect_pins -sd_name $sd -pin_names {"ACLK" "VTA_0:ap_clk"}
+sd_connect_pins -sd_name $sd -pin_names {"ARESETN" "VTA_0:ap_rst_n"}
 save_smartdesign -sd_name $sd
-# Regenerate before touching the top level: until the hierarchy is rebuilt, the
-# FIC_0_PERIPHERALS_0 instance does not expose the ports added above.
 build_design_hierarchy
 generate_component -component_name {FIC_0_PERIPHERALS} -recursive 1
 
-# Join the existing FIC_3 clock and reset nets by naming a pin already on each: those nets
-# are already driven, and connecting a driver a second time is rejected.
-set top MPFS_DISCOVERY_KIT
-open_smartdesign -sd_name $top
-sd_update_instance -sd_name $top -instance_name {FIC_0_PERIPHERALS_0}
-sd_connect_pins -sd_name $top -pin_names {"FIC_3_PERIPHERALS_0:PCLK" "FIC_0_PERIPHERALS_0:VTA_CLK"}
-sd_connect_pins -sd_name $top -pin_names {"FIC_3_PERIPHERALS_0:PRESETN" "FIC_0_PERIPHERALS_0:VTA_ARESETN"}
-save_smartdesign -sd_name $top
+# Nothing outside this SmartDesign changes: VTA runs on the clock FIC_0_PERIPHERALS
+# already receives.
 build_design_hierarchy
 generate_component -component_name {MPFS_DISCOVERY_KIT} -recursive 1
-puts "VTA: integrated into $sd on FIC_3_CLK (50 MHz), CDC in the interconnects"
+puts "VTA: integrated into $sd on ACLK (125 MHz), direct connections"
 
-# Re-derive timing constraints, then tell the tools
-# that the VTA and FIC0 domains are unrelated - the only paths between them go through the
-# interconnects' CDC synchronizers.
-# The hierarchy has to be rebuilt after regenerating the top component, otherwise deriving
+# Re-derive timing constraints. The hierarchy has to be rebuilt after regenerating the top component, otherwise deriving
 # constraints cannot find the top level.
 build_design_hierarchy
 set_root -module {MPFS_DISCOVERY_KIT::work}
