@@ -982,3 +982,46 @@ comfortably:
     of the three failure modes hit so far can recur.
 
 That is the next thing to try.
+
+## Multi-pass place-and-route buys nothing - P&R is exhausted (2026-09-16)
+
+Ran PLACEROUTE with MULTI_PASS_LAYOUT, 5 seeds, STOP_ON_FIRST_PASS:false, EFFORT_LEVEL:true,
+ranked by the slack of VTA's own clock domain. Per-seed worst slack on
+CLOCKS_AND_RESETS_0/CCC_FIC_x_CLK/PF_CCC_C0_0/pll_inst_0/OUT0:
+
+    seed 1  -0.413
+    seed 2  -0.052
+    seed 3  +0.043   <- best, saved as MPFS_DISCOVERY_KIT_r1_s3
+    seed 4  -0.038
+    seed 5  +0.002
+
+Best of five is +0.043 ns, against +0.056 ns from a single DEFAULT pass. So more placement
+effort does not buy margin here - the design is at its structural limit at 125 MHz, and the
+seed-to-seed spread (0.46 ns) dwarfs the margin itself. Note most seeds FAIL timing; the
+default single pass got lucky.
+
+The resulting bitstream does not boot the board at all (both consoles silent), so it was not
+even usable as a placement-variation experiment. Restored the known-good design; mem and
+alu pass again.
+
+Two process notes from this run, both of which cost time:
+  - MULTI_PASS_CRITERIA has legal values SLOWEST_CLOCK, SPECIFIC_CLOCK, VIOLATIONS and
+    TOTAL_POWER. TIMING is NOT legal. SLOWEST_CLOCK ranks by frequency and would pick the
+    50 MHz FIC3 domain, so name the FIC0 clock with SPECIFIC_CLOCK.
+  - Libero writes its logfile only when the script FINISHES, and exits 0 even when a step
+    failed. A build that died at configure_tool therefore looks identical to one still
+    running if you judge by the log. Check for a live 'libero_bin' process, and grep the log
+    for '^Error' after each step (build_multipass.sh now does).
+  - The multi-pass report files are per seed: MPFS_DISCOVERY_KIT_timing_r1_sN.rpt. Reading
+    _r1_s1 gives seed 1, NOT the best pass. Read the seed the log says was saved.
+
+### Where that leaves the timing hypothesis
+
+It could not be tested this way: the experiment needed more margin to exist, and P&R cannot
+produce it. Both remaining routes to margin are:
+  1. lower VTA's clock  - blocked four times at the Libero integration level
+  2. re-time the RTL    - pipeline compute/loadUop/tensorLoad/vmeCmd/cmdGen's address
+                          arithmetic (~30 logic levels), our own Chisel, validated in TSIM,
+                          single-clock, no integration changes
+Route 2 is the only one not yet tried, and the seed spread above says it needs to buy
+several hundred picoseconds to make the design robust rather than lucky.
