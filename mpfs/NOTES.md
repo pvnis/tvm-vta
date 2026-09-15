@@ -825,3 +825,58 @@ Note: tvm-vta/build/libvta_hw.so is currently built WITH VTA_TSIM_MULTI_RD=1 (it
 GEMM and ALU in TSIM). Rebuild without the variable for stock behaviour; the Makefile does
 not track Scala changes, so delete build/chisel, build/verilator and build/libvta_hw.so
 first, and sbt needs JDK 11 plus tools/sbt on PATH (see the top of this file).
+
+## Tightest localization yet: bias_probe.py (2026-09-15)
+
+Every earlier comparison was across DIFFERENT programs - an ALU program that works versus a
+GEMM program that does not - which leaves open that the program, not the datapath, is what
+differs. bias_probe.py closes that: one instruction stream computing
+
+    y = x . w^T + bias
+
+where x/w are loaded by the LOAD module and consumed by the MAC array, and bias is loaded
+into the ACC scratchpad by the COMPUTE module and added with an ALU op. Validated in FSIM
+first (bias + product, exactly right), so a hardware result is unambiguous.
+
+On hardware, red=1:
+
+    == bias only (GEMM contributed nothing) : True
+    tile[0,0] expected [101,102,...,116]
+    tile[0,0] got      [100,100,...,100]
+
+So within ONE program: the ACC load works, the ALU works, the store works, and the MAC array
+contributes EXACTLY zero - a clean zero, not garbage. That narrows the fault to inp/wgt
+reaching the MAC: either the LOAD module's scratchpad writes, or the MAC array itself.
+
+Note the structural point this raises: acc's TensorLoad is instantiated inside COMPUTE while
+inp's and wgt's are instantiated inside LOAD. Same module, different instances - so the
+working and broken paths differ by which parent instantiates them, not by the module code.
+
+### GEMM at red=4 wedges the device
+
+red=4 does not return zeros - it times out, with the same signature as the #2 wedge
+(ctrl=0x1, cycle count unchanged, insn count and address correct):
+
+    no completion after 10000 ms (insn_count=23, insn at 0xc4400b00). cycles 1129 -> 1129
+
+That is the first thing all session to wedge the device on demand rather than by luck, which
+makes it a candidate reproduction for #2 - and suggests #1 and #2 may share a cause after
+all. It needs confirming across several resets before being relied on; two attempts gave
+mixed results and the third could not be read because the board fell over (below).
+
+### Board damage and recovery - a caution about the reset loop
+
+Repeated hard resets left the board booting into emergency maintenance mode
+("Give root password for maintenance"), with systemd-fsck-root and systemd-growfs-root
+failed. e2fsck -fy on /dev/mmcblk0p3 found NOTHING to fix, so the filesystem was clean and
+the emergency boot most likely cascaded from growfs failing (the partition is already at
+maximum size since we grew it - that service cannot succeed again).
+
+Recovery: log in on the serial console with the maintenance password, remount ro, fsck,
+reboot -f. Then, because a Linux reboot does not reset the fabric, the device was STILL
+wedged (mem passes - it never launches VTA - while alu hangs); reprogramming the FPGA
+cleared it and all tests pass again.
+
+Lesson for the next person: reset_board.sh reboots Linux, which is NOT enough to clear a
+wedged accelerator, and hammering it risks the rootfs. To get a genuinely clean device,
+reprogram the FPGA (~2 min, and it is what actually resets the fabric).
