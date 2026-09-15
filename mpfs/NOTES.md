@@ -1025,3 +1025,67 @@ produce it. Both remaining routes to margin are:
                           single-clock, no integration changes
 Route 2 is the only one not yet tried, and the seed spread above says it needs to buy
 several hundred picoseconds to make the design robust rather than lucky.
+
+## Route 2 done: re-timing WORKS, and it REFUTES the timing hypothesis (2026-09-16)
+
+### The re-timing itself succeeded
+
+rdLineClNb, rdLen1stMaxTransClNb, rd1stPulseOffsetTensNb and rdLastPulseTensNb in
+GenVMECmdWide are pure functions of the DRAM line start address, which only changes on
+io.start or stride. They were computed COMBINATIONALLY from the address register, putting a
+modulo/shift/add/compare chain directly in front of rdLen -> stride -> rdCmdStartIdx, the
+cone that was failing. Now they are computed from the NEXT address and registered under the
+same condition, so they are valid on the same cycle as before.
+
+Validated in TSIM against the original, same build otherwise:
+
+    metric          original    re-timed
+    GEMM result     64/64       64/64
+    cycle count     244         244
+    read bursts     20/1/4/64/1 20/1/4/64/1
+
+Cycle-identical and burst-identical; bias_probe 2x2 and 4x4 and GEMM red=4 also correct.
+
+FPGA result:  worst slack +0.056 ns -> +0.628 ns at 125 MHz (+572 ps, more than the 0.46 ns
+seed spread), and the critical path MOVED OUT of cmdGen entirely - it is now in
+store/tensorStore. Resources unchanged: LSRAM 241, Math 128.
+
+Two bugs I introduced and fixed, both worth remembering:
+  - rdLineClNb was declared chiselTypeOf(tmp) but is assigned Mux(..., tmp, tmp + 1.U),
+    one bit wider - the carry was silently truncated.
+  - The precompute fires on the io.start cycle, but cmdGen.io.xsize comes from decR =
+    RegEnable(io.inst, io.start), which during that cycle still holds the PREVIOUS
+    instruction. The precompute captured the wrong line length and issued 132 bursts of 256
+    beats instead of 5 small ones (134x slower, still functionally correct). Fixed with an
+    xsizeNow input driven from the combinational decode. This trap is a direct consequence
+    of our own earlier decR change; note dram_offset and sram_offset are already wired from
+    the combinational dec for exactly this reason.
+  The 134x slowdown was diagnosed from the DPI burst logging added while chasing the GEMM
+  bug - without it the symptom was just "much slower" with no cause.
+
+### And the result that matters: GEMM still fails
+
+On the re-timed design, freshly programmed, with mem / alu / pad all passing:
+
+    bias_probe 2x2, 4x4, 8x8   all FAIL
+    gemm_probe identity        0/64
+
+With ELEVEN TIMES the timing margin. If marginal timing were the cause, this should have
+fixed it or at least changed the behaviour. It did not.
+
+=> THE TIMING HYPOTHESIS IS REFUTED. It drove the clock-lowering attempts, the multi-pass
+experiment and this re-timing, and it is wrong. The GEMM failure and the wedge are something
+else.
+
+What that leaves: a functional fault that does not reproduce in FSIM or TSIM, is not
+addressing, alignment, concurrency, ID handling, burst shape, beat gaps or timing - and yet
+GEMM demonstrably computed correctly in one session earlier today. Whatever it is, it is
+state-dependent rather than a fixed logic error, and simulation cannot see it.
+
+The re-timing is worth KEEPING regardless: it is behaviourally identical, costs no cycles
+and no resources, and takes the design from 0.7% margin (where most P&R seeds fail) to 7.9%.
+It just is not the fix for GEMM.
+
+Next honest step: hardware observation. SmartDebug live probes or an ILA on the inp/wgt
+scratchpad write ports and the MAC operands would show directly whether data reaches the
+scratchpads - the one question no host-side or simulation experiment has been able to answer.

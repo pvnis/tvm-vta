@@ -481,6 +481,11 @@ class GenVMECmdWide(tensorType: String = "none", debug: Boolean = false)(
 
     val ysize = Input(UInt(M_SIZE_BITS.W))
     val xsize = Input(UInt(M_SIZE_BITS.W))
+    // Combinational xsize, valid on the io.start cycle itself. io.xsize comes from decR,
+    // which is only loaded AT start and therefore still holds the PREVIOUS instruction
+    // during that cycle - fine for the per-command logic, which runs later, but not for the
+    // precompute below, which must capture the new line's length on the start cycle.
+    val xsizeNow = Input(UInt(M_SIZE_BITS.W))
     val xstride = Input(UInt(M_STRIDE_BITS.W))
     val dram_offset = Input(UInt(M_DRAM_OFFSET_BITS.W))
     val sram_offset = Input(UInt(M_SRAM_OFFSET_BITS.W))
@@ -554,28 +559,53 @@ class GenVMECmdWide(tensorType: String = "none", debug: Boolean = false)(
   //First transaction in a line length (1st or stride)
   val maxTransfer = (1 << mp.lenBits).U // max number of pulses in transfer
   val maxTrBytes = maxTransfer << log2Ceil(clBytes)
-  val rdLen1stMaxTransBytes = maxTrBytes - rdLineClBeginAddr % maxTrBytes
-  // get the number of cachelines till maxTrBytes aligned address
-  val rdLen1stMaxTransClNb = rdLen1stMaxTransBytes >> log2Ceil(clBytes)
+
+  // PolarFire timing: these four quantities are pure functions of the DRAM line start
+  // address, and that address only changes on io.start or stride. Computing them
+  // combinationally from the rdLineElemBeginAddr REGISTER puts a modulo/shift/add/compare
+  // chain in front of rdLen, stride and finally rdCmdStartIdx - the cone that fails 125 MHz
+  // on MPFS095T (worst path: rdLineElemBeginAddr -> rdCmdStartIdx, ~30 levels).
+  //
+  // Instead compute them from the NEXT address, the same value being loaded into
+  // rdLineElemBeginAddr, and register them under the same condition. They then become
+  // available on exactly the same cycle as before - no added latency, no protocol change -
+  // but the long arithmetic now ends at these registers instead of running on through the
+  // command logic.
+  val derivedAddr = Mux(io.start, xferElemInitAddr, nextLineBeginElemAddr)
+  val derivedClAddr = derivedAddr & dramClAddrAlignMask
+  val derivedUpdate = io.start || stride
+
+  val rdLineBytesNext = io.xsizeNow << log2Ceil(elemBytes)
+  val rdLen1stMaxTransBytesNext = maxTrBytes - derivedClAddr % maxTrBytes
+  val rdLen1stMaxTransClNb = Reg(UInt((mp.lenBits + 1).W))
+  when (derivedUpdate) { rdLen1stMaxTransClNb := rdLen1stMaxTransBytesNext >> log2Ceil(clBytes) }
 
   //Transaction begin mask. Number of tensors to read from right
-  val rd1stPulseOffsetBytes = rdLineElemBeginAddr % clBytes.U
-  assert(rd1stPulseOffsetBytes >> log2Ceil(elemBytes) <= tp.clSizeRatio.U,
+  val rd1stPulseOffsetBytesNext = derivedAddr % clBytes.U
+  val rd1stPulseOffsetTensNb = Reg(UInt((log2Ceil(tp.clSizeRatio) + 1).W))
+  when (derivedUpdate) {
+    rd1stPulseOffsetTensNb := rd1stPulseOffsetBytesNext >> log2Ceil(elemBytes)
+  }
+  assert(!io.isBusy || rd1stPulseOffsetTensNb <= tp.clSizeRatio.U,
     "-F- Expecting the number of tensors to skip in CL")
-  val rd1stPulseOffsetTensNb =  Wire(UInt((log2Ceil(tp.clSizeRatio) + 1).W))
-  rd1stPulseOffsetTensNb := rd1stPulseOffsetBytes >> log2Ceil(elemBytes)
 
-  val rdLineClNbTmp = (rdLineBytes + rd1stPulseOffsetBytes) >> log2Ceil(clBytes)
-  val rdLineClNb =
-    Mux((rdLineBytes + rd1stPulseOffsetBytes) % clBytes.U === 0.U, rdLineClNbTmp, rdLineClNbTmp + 1.U)
+  val rdLineClNbTmpNext = (rdLineBytesNext + rd1stPulseOffsetBytesNext) >> log2Ceil(clBytes)
+  val rdLineClNb = Reg(UInt((rdLineClNbTmpNext.getWidth + 1).W))
+  when (derivedUpdate) {
+    rdLineClNb := Mux((rdLineBytesNext + rd1stPulseOffsetBytesNext) % clBytes.U === 0.U,
+      rdLineClNbTmpNext, rdLineClNbTmpNext + 1.U)
+  }
 
   //Transaction end mask. Number of tensors to read from left
-  val rdLastPulseBytes =  (rdLineElemBeginAddr + rdLineBytes) % clBytes.U
-  assert(rdLastPulseBytes >> log2Ceil(elemBytes) <= (clBytes/elemBytes).U,
+  val rdLastPulseBytesNext = (derivedAddr + rdLineBytesNext) % clBytes.U
+  val rdLastPulseTensNbTmpNext = rdLastPulseBytesNext >> log2Ceil(elemBytes)
+  val rdLastPulseTensNb = Reg(UInt((log2Ceil(clBytes/elemBytes) + 1).W))
+  when (derivedUpdate) {
+    rdLastPulseTensNb := Mux(rdLastPulseTensNbTmpNext === 0.U,
+      (clBytes/elemBytes).U, rdLastPulseTensNbTmpNext)
+  }
+  assert(!io.isBusy || rdLastPulseTensNb <= (clBytes/elemBytes).U,
     "-F- Expecting the number of active tensors in CL")
-  val rdLastPulseTensNb =  Wire(UInt((log2Ceil(clBytes/elemBytes) + 1).W))
-  val rdLastPulseTensNbTmp =  rdLastPulseBytes >> log2Ceil(elemBytes)
-  rdLastPulseTensNb :=  Mux(rdLastPulseTensNbTmp === 0.U, (clBytes/elemBytes).U, rdLastPulseTensNbTmp)
 
 
 
@@ -761,6 +791,7 @@ class GenVMECmdWideTL(tensorType: String = "none", debug: Boolean = false)(
 
   cmdGen.io.ysize := decR.ysize
   cmdGen.io.xsize := decR.xsize
+  cmdGen.io.xsizeNow := dec.xsize
   cmdGen.io.xstride := decR.xstride
   cmdGen.io.dram_offset := dec.dram_offset
   cmdGen.io.sram_offset := dec.sram_offset
