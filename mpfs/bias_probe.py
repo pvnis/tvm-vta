@@ -31,7 +31,10 @@ CC = os.environ.get("VTA_CROSS_CC", "/home/dmd/polarfire_sandbox/vta/tools/rvcc/
 env = vta.get_env()
 
 red = int(sys.argv[1]) if len(sys.argv) > 1 else 1
-o, m = 2, 2
+# o = batch tiles, m = output-channel tiles. Size turned out to matter, so make them
+# settable rather than fixed at 2.
+o = int(sys.argv[2]) if len(sys.argv) > 2 else 2
+m = int(sys.argv[3]) if len(sys.argv) > 3 else 2
 
 x = te.placeholder((o, red, env.BATCH, env.BLOCK_IN), name="x", dtype=env.inp_dtype)
 w = te.placeholder((m, red, env.BLOCK_OUT, env.BLOCK_IN), name="w", dtype=env.wgt_dtype)
@@ -115,10 +118,22 @@ full = (product + b_np.astype("int32")).astype(y.dtype)
 bias_only = b_np.astype(y.dtype)
 prod_only = product.astype(y.dtype)
 
-print(f"[bias] TARGET={env.TARGET} red={red}")
+print(f"[bias] TARGET={env.TARGET} red={red} o={o} m={m}")
 print(f"[bias]   == bias + product (all correct) : {np.array_equal(got, full)}")
 print(f"[bias]   == bias only (GEMM contributed nothing) : {np.array_equal(got, bias_only)}")
 print(f"[bias]   == product only (bias load broken)      : {np.array_equal(got, prod_only)}")
 print(f"[bias]   still sentinel (never stored)           : {int((got == SENTINEL).sum())}/{got.size}")
+print(f"[bias]   elements correct                        : {int((got==full).sum())}/{got.size}")
+# Per-tile map: which (batch, out-channel) tiles are right. A structured pattern says far
+# more than an aggregate count - e.g. only the first tile right, or only the first row.
+bad = []
+for bb in range(o):
+    row = ""
+    for i in range(m):
+        row += "." if np.array_equal(got[bb, i, 0], full[bb, i, 0]) else "X"
+    bad.append(row)
+print("[bias] tile map (. = correct, X = wrong), rows = batch tiles:")
+for r in bad:
+    print("[bias]   " + r)
 print(f"[bias] tile[0,0] expected {full[0,0,0].tolist()}")
 print(f"[bias] tile[0,0] got      {got[0,0,0].tolist()}")

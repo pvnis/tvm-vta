@@ -880,3 +880,59 @@ cleared it and all tests pass again.
 Lesson for the next person: reset_board.sh reboots Linux, which is NOT enough to clear a
 wedged accelerator, and hammering it risks the rootfs. To get a genuinely clean device,
 reprogram the FPGA (~2 min, and it is what actually resets the fabric).
+
+## MAJOR REVISION: GEMM is not fundamentally broken (2026-09-15)
+
+After recovering the board from emergency mode and REPROGRAMMING the FPGA, GEMM computed
+correctly - repeatedly, at every size tried:
+
+    bias_probe red=1,2,3,4,8 (2x2 tiles)   all "bias + product (all correct) : True"
+    gemm_probe identity red=1               64/64 correct
+
+That last one is the exact probe that returned all zeros every time all session. So the
+"GEMM returns zeros" symptom is NOT a logic bug in the GEMM datapath: the same bitstream,
+the same program and the same driver produce correct results in some sessions.
+
+What this invalidates: every GEMM measurement taken earlier in the session was made on a
+device that had been left in a bad state by a previous program, because reset_board.sh only
+reboots LINUX and the fabric is not reset by that. The conclusion that "the MAC array
+contributes exactly zero" was a real observation of a degraded device, not of the design.
+
+### But it is not reliable either
+
+Subsequent programming sessions are bad again: on a freshly reprogrammed fabric, 2x2 GEMM
+failed 10/10 (die temperature 57.2 C, i.e. COOLER than the 63.6 C during the good runs, so
+a simple thermal explanation does not fit). Within a bad session the failure is uniform -
+the GEMM contributes exactly zero to every output tile - and running a larger GEMM appears
+to push a good session into a bad one.
+
+So the behaviour varies per programming session, not per run:
+    some sessions   GEMM correct at every size tried
+    most sessions   GEMM contributes zero, uniformly
+    ALU / pad / mem correct in every session observed
+
+### What that means
+
+Correct logic (FSIM and TSIM pass), correct software (instruction stream, addresses and DRAM
+contents all verified byte-for-byte), simple traffic reliable, complex traffic
+session-dependent, on a design with +0.056 ns of post-layout slack at 125 MHz - 0.7% of the
+period. That is a physical marginality, not a functional bug, and it is consistent with
+everything observed including the intermittent wedge (#2): the GEMM datapath and the MAC
+array light up far more of the fabric than an ALU shift does.
+
+It also means #1 and #2 are most likely the SAME root cause, which is why neither could be
+pinned down as a logic error.
+
+### Next step
+
+Give VTA real timing margin - the work that was started and abandoned. The three failed
+attempts all made the same mistake: CLOCK_DOMAIN_CROSSING was enabled on ports of the SHARED
+system interconnects (FIC0_INITIATOR, DMA_INITIATOR), which carry all MSS traffic, and the
+board stopped booting every time regardless of the clock source. Microchip's own VectorBlox
+integration in this reference design does it differently: a SEPARATE CoreAXI4Interconnect
+instance acts as a dedicated 1x1 CDC bridge, and the system interconnects stay single-clock.
+Redo it that way, then VTA can run at 100 MHz (or 50) with the margin it needs.
+
+Do NOT trust any hardware measurement that was not taken on a freshly REPROGRAMMED fabric.
+reprogram_board.sh does that and waits for the board; reset_board.sh (Linux reboot) does not
+reset the fabric and is not sufficient.
