@@ -1557,3 +1557,50 @@ Two consequences recorded:
 Earlier TSIM results in these notes are still sound: no Chisel edit happened between the
 library's build (Sep 16 00:57) and today's, and the bitstream's Verilog is from Sep 16
 01:01, so library and bitstream matched.
+
+### The pipeline fix closed the path and did NOT fix GEMM
+
+Build with scratchpadReadLatency=1, on the reverted 125 MHz direct topology:
+
+    REF_CLK_50MHz -> R18
+    worst VTA slack +0.708 ns (was +0.139), min period 7.157 ns, slow_lv_ht
+      from VTA/store/inst_q/ram_ram_0_1/INST_RAM1K20_IP:A_CLK
+      to   VTA/store/tensorStore/tensorStore/xrem[13]:D
+
+The inp-scratchpad-to-MAC path is GONE from the worst-path list, which also proves the new
+RTL really is in the bitstream. Board result, GEMM as the FIRST programs on a fresh fabric:
+
+    o=1  0/32     o=2  0/64     o=3  0/96     o=4  0/128     every tile zero
+
+**So the timing explanation is falsified.** The indicted path was fixed - 5x the margin, no
+longer critical - and GEMM is bit-for-bit as broken as before. The 0.139 ns inp->MAC path
+was NOT the cause of the zeros. The root-cause claim recorded earlier today is withdrawn.
+
+What the fix DID change is the shape of the wedge: there are now no driver timeouts at all.
+Every program is dispatched and completes promptly; after about four or five programs VTA
+starts reporting done instantly while writing nothing (NOTRUN with the sentinel intact, 20
+executions in 0.2 s). Previously it hung with the cycle counter frozen. That is a different
+failure and probably needs its own investigation rather than being folded into this one.
+
+Two of my own errors to correct in the record:
+
+  - o sets XSIZE, not ysize. The driver's dump shows the inp load is x_size=o, y_size=1.
+    ysweep's premise and the "multi-line path" reasoning built on it were wrong. Its
+    results stand (GEMM zero at every o); its labelling does not.
+  - matrix.py runs ALU first, so on a device that stops after ~5 executions every GEMM
+    result is NOTRUN - the program never ran. The first board test of this build was
+    therefore not a test of GEMM at all. Test ordering matters when executions are scarce.
+
+### The one thing that has ever made GEMM work
+
+bias_probe, which DMA-loads the accumulator before the GEMM instead of relying on the
+reset-GEMM. A pure GEMM emits TWO gemm instructions - a reset one issued BEFORE inp/wgt are
+even loaded, then an accumulating one:
+
+    [0] LOAD uop sram_base=0   [1] GEMM      <- reset
+    [2] LOAD inp  [3] LOAD wgt  [4] LOAD uop sram_base=1  [5] GEMM   <- accumulate
+    [6] STORE out
+
+"Output is zero" therefore means instruction [5] contributed nothing, while the equivalent
+accumulate in bias_probe demonstrably worked (bias + product, 64/64). That asymmetry - not
+timing - is where the next investigation should start.
