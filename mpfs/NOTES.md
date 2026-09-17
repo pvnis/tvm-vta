@@ -1511,3 +1511,49 @@ nothing orders those two events.
 
 Note the 100mhz.v2 build this wiring was copied from NEVER BOOTED, so it was never
 evidence that the wiring works - only evidence of what someone previously wrote.
+
+## The fix: scratchpadReadLatency = 1 (2026-09-17, late)
+
+The 100 MHz + CDC route was reverted (vta_integrate.tcl restored from the .125mhz.bak copy,
+CDC parameters back to false, the VTA clock group removed from vta_clocks.sdc). VTA is back
+on FIC_0_CLK with the direct topology that has always been reliable for the ALU.
+
+The timing report said the failing path is the inp scratchpad LSRAM output reaching the MAC
+array multiplier inputs, and that nearly 3 ns of it is pure ROUTING - one LUT between the
+RAM and the MACC, the rest wire:
+
+    RAM1K20_IP:A_DOUT[1]   arrival 2.284
+    CFG_20:A  (net)        arrival 5.220     <- 2.94 ns of routing
+    CFG_20:Y  (LUT)        +0.071
+    MACC_IP:A[10]          +0.020
+
+VTA already has a parameter for exactly this. TensorGemm extends TensorGemmPipelinedSplit,
+which carries:
+
+    val scratchpadReadLatency = 0      // "additional pipe latency of wgt/inp read if needed"
+    val inpRdData0 = if (scratchpadReadLatency > 0) RegNext(io.inp.rd(0).data) else io.inp.rd(0).data
+    ShiftRegister(inpRdData0(...), mvmInpRdLatency)   // "delay to deliver over distance"
+
+Setting it to 1 registers the inp read data on its way to the MVMs, splitting that long
+route across two cycles. It is fully plumbed - the wgt read INDEX is delayed by the same
+amount so wgt data arrives with the delayed inp data, and reset_pipe, acc_idx_pipe and
+wrpipe0 all add it to their latencies - so this is a supported configuration, not a hack.
+
+### A trap that invalidated my first attempt at validating it
+
+TSIM loads a PREBUILT build/libvta_hw.so, and nothing in the flow rebuilds it when the
+Chisel changes. The first "TSIM passes all sizes with the fix" run was against a library
+and generated Verilog from the previous day; the change had never been compiled. It was
+caught only because sbt happened to be missing from PATH at the next step.
+
+Two consequences recorded:
+
+  - sbt is NOT on PATH by default. It lives at vta/tools/sbt/bin.
+  - run_sim.sh now refuses to run when any .scala file is newer than libvta_hw.so, rather
+    than reporting a pass that means nothing.
+  - A clean build/verilator is needed when the RTL partitioning changes, or the link fails
+    with duplicate symbols from stale object files.
+
+Earlier TSIM results in these notes are still sound: no Chisel edit happened between the
+library's build (Sep 16 00:57) and today's, and the bitstream's Verilog is from Sep 16
+01:01, so library and bitstream matched.

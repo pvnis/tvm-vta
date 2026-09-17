@@ -554,7 +554,21 @@ class TensorGemmPipelinedSplit (implicit p: Parameters) extends TensorGemmIfc {
   val m = Module(new TensorGemmIndexGenerator)
 
   // additional pipe latency of wgt/inp read if needed
-  val scratchpadReadLatency = 0
+  //
+  // PolarFire: 1, not 0. On MPFS095T the worst path in the whole design was the inp
+  // scratchpad LSRAM output feeding the MAC array multiplier inputs, meeting 125 MHz by
+  // 0.139 ns at slow_lv_ht - and nearly 3 ns of that path is pure routing from the LSRAM
+  // to the MACC blocks, with a single LUT in between. That is exactly the "deliver over
+  // distance" problem this parameter exists for. On hardware it showed up as GEMM being
+  // intermittently wrong (all-zero results) while the ALU, which never reads the inp
+  // scratchpad, was always correct.
+  //
+  // Setting it to 1 registers io.inp.rd(0).data on the way to the MVMs (see inpRdData0
+  // below) so the long route is split across two cycles. Everything that has to stay in
+  // step with it is already parameterised on this value: the wgt read INDEX is delayed by
+  // the same amount (so wgt data arrives with the delayed inp data), and reset_pipe,
+  // acc_idx_pipe and wrpipe0 all add it to their latencies.
+  val scratchpadReadLatency = 1
   val inpReadIdxLatency = 0
   val uopReadLatency = 0
 
