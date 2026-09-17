@@ -1367,3 +1367,53 @@ size on the exact RTL in the bitstream. What breaks is that the accelerator stop
 stops sooner the longer the board has been mistreated. The next measurement to take, on a
 freshly power-cycled board, is simply: how many executions does each program survive, using
 matrix.py, before the cycle counter freezes.
+
+## ROOT CAUSE: the inp-scratchpad -> MAC path passes 125 MHz by 0.139 ns (2026-09-17)
+
+The three worst paths in the whole design, from the current build's own timing report
+(max_timing_multi_corner, slow_lv_ht):
+
+    Path 1  slack +0.139 ns  min period 7.726 ns
+      from VTA/load/tensorLoad_0/tensorLoad/tensorFile_0_.../INST_RAM1K20_IP:A_CLK
+      to   VTA/compute/tensorGemm/mvc_0/dot_0_15/m_1/...MACC_PHYS_INST/INST_MACC_IP:A[10]
+    Path 2  slack +0.189 ns   (same endpoints, dot_0_9)
+    Path 3  slack +0.366 ns   (same endpoints, dot_0_13)
+    Path 4  slack +0.463 ns   VTA/load/tensorLoad_1/.../vmeCmd/rdCmdStartIdx[8]
+
+The critical path is the inp scratchpad LSRAM output feeding the MAC array multiplier
+inputs - the GEMM datapath - meeting 125 MHz by 1.7% of the period at the slow corner.
+
+This accounts for every observation, including the ones that defeated the whole
+investigation:
+
+  - The ALU never uses this path, so it is correct 5/5, always.
+  - GEMM depends on it entirely, so it is wrong nearly always and occasionally right.
+  - The 14:02-14:05 window when GEMM was correct followed a ~10 hour idle: the die was
+    cool. It failed once warm. Temperature is exactly what moves a 0.139 ns margin.
+  - TSIM passes every size: functional simulation has no timing.
+  - A power cycle changes nothing, because nothing is in a stuck state.
+  - All zeros rather than garbage: late data at the multiplier inputs latches as zero.
+
+It also puts the re-timing work in proportion. Paths 4 and 5 ARE the GenVMECmdWide cone
+that was re-timed, now at +0.463/+0.477 and no longer critical - the re-timing did what it
+was meant to, it just fixed the second-worst path while the real one was never touched.
+"The timing hypothesis is refuted", recorded earlier in these notes, was simply wrong.
+
+### The fix, and why the earlier attempts failed
+
+Worst VTA slack by build:
+
+    current, 125 MHz     +0.139 ns   inp scratchpad -> MAC input
+    100mhz,  100 MHz     +1.670 ns   acc scratchpad internal
+    100mhz.v2, 100 MHz   +1.853 ns   uop VME command
+
+At 100 MHz the inp->MAC path is not even critical: 13x the margin. Both 100 MHz builds
+already exist and their timing is good. They never booted for an unrelated reason - the
+constraint-flow bug placed the board's 50 MHz oscillator on the wrong pin:
+
+    MPFS_DISCOVERY      REF_CLK_50MHz -pin_name R18   (correct, boots)
+    MPFS_DISCOVERY.100mhz    -pin_name E10            (never booted)
+    MPFS_DISCOVERY.100mhz.v2 -pin_name E12            (never booted)
+
+So the clock-lowering approach was never actually tested. That bug is now removed from
+vta_integrate.tcl, so a 100 MHz build with correct I/O constraints is the fix.
