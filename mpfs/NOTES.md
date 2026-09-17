@@ -1140,3 +1140,44 @@ bug, not the GEMM bug.
 
 Every hardware measurement taken between the first rebuild and this fix was made on a design
 with unconstrained I/O placement and should be treated as unreliable.
+
+## Clean-platform measurements, and SmartDebug is not scriptable here (2026-09-17)
+
+First measurements taken on a correctly-constrained build (REF_CLK on R18) and a freshly
+reprogrammed fabric. VTA's cycle register (0x04) read after each run:
+
+    fresh fabric        0
+    after alu 1       641
+    after gemm red=1  429
+    after gemm red=16 3837      (~9x for 16x the weight data)
+
+So on a clean fabric EVERY GEMM completes and reports its cycle count, and the time scales
+with the weight volume. The DMA really happens, the program really finishes - and the MAC
+output is still exactly zero. No wedge occurred during that sequence either.
+
+(The same measurement taken minutes earlier on an already-wedged device showed the counter
+frozen at 0x122 for every run. Any cycle-count measurement is meaningless unless the counter
+is seen to CHANGE between runs.)
+
+### SmartDebug cannot be driven from scripts in this setup
+
+  - The Libero project tcl context has none of read_lsram / read_usram / read_active_probe /
+    select_active_probe / set_live_probe / list_probes - all report "invalid command name".
+  - run_tool -name {SMARTDEBUG} is not a valid tool name.
+  - Designer/bin64/g5probe takes -s <script> but exposes none of those commands either.
+  - Designer/bin64/sdbg is the Qt GUI; under xvfb it aborts
+    (terminate called after throwing an instance of 'Jobtools::ToolStatus').
+
+So the SmartDebug route needs a human at the GUI. Its Memory Blocks view can read LSRAM
+contents over JTAG, which would answer the outstanding question - are the weights actually
+in the wgt scratchpad? - directly.
+
+### The alternative that IS within scripting reach: instrument the RTL
+
+Add a read-only debug register to the VCR that latches the data being written into the
+wgt (and inp) scratchpad, and read it from Linux over the control interface that is already
+proven reliable. After a GEMM:
+    register holds the expected weights -> the writes happen, fault is on the read/MAC side
+    register holds zero                 -> the write data itself is zero, fault is upstream
+That is a Chisel change plus a rebuild, but it gives permanent scriptable visibility instead
+of a one-off GUI session, and it uses the register path we know works.
