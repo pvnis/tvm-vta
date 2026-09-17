@@ -1089,3 +1089,54 @@ It just is not the fix for GEMM.
 Next honest step: hardware observation. SmartDebug live probes or an ILA on the inp/wgt
 scratchpad write ports and the MAC operands would show directly whether data reaches the
 scratchpads - the one question no host-side or simulation experiment has been able to answer.
+
+## ROOT CAUSE OF EVERY BOOT FAILURE: my flow dropped the I/O constraints (2026-09-17)
+
+The board constraint is explicit:
+
+    set_io -port_name REF_CLK_50MHz -pin_name R18 -fixed true   (BOARD_MISC.pdc)
+
+    working build (Sep 12):   REF_CLK_50MHz  R18  locked Yes
+    every rebuild since:      REF_CLK_50MHz  E12  locked No     <- auto-placed
+
+vta_integrate.tcl called organize_tool_files with only two SDC files. That call REPLACES a
+tool's constraint list rather than adding to it, so all eight I/O PDCs and the floorplan PDC
+were silently dropped from SYNTHESIZE, PLACEROUTE and VERIFYTIMING. The 50 MHz oscillator
+constraint went with them and the fabric was placed with its reference clock on the wrong
+pin.
+
+That is why EVERY rebuilt design hung at "Initializing Mi-V IHC V2" - HSS's first access to
+a fabric peripheral, exactly what a dead fabric clock looks like. The tell was there and I
+walked past it: the multi-pass build was LOGICALLY IDENTICAL to the working design and still
+would not boot. A design that cannot boot when nothing about it changed is a flow problem,
+not a design problem.
+
+RETRACTED as a result:
+  - "enabling CLOCK_DOMAIN_CROSSING on the shared interconnects makes the board unbootable"
+  - "a fabric PLL referenced from an existing clock breaks boot"
+  - the +0.628 ns figure for the re-timed design: that placement was unconstrained. With the
+    I/O constraints restored the same RTL gives +0.139 ns, against +0.056 ns for the
+    original. Still an improvement, but 2.5x not 11x.
+  - the "timing hypothesis is refuted" claim is therefore WEAKENED, not established: the
+    decisive test (a large margin increase) has never actually been run on a valid build.
+
+Fixed by removing the derive_constraints_sdc / import_files / organize_tool_files block from
+vta_integrate.tcl entirely. The base design already associates its constraints correctly and
+adding VTA introduces no new clock, so there was never anything to add. Verified: the
+rebuild now has 15 io_pdc associations (matching the working build) and REF_CLK_50MHz back
+on R18, locked.
+
+Rule for the future: never call organize_tool_files unless you enumerate EVERY file the tool
+already had. Check a rebuild with
+    grep -a REF_CLK_50MHz <project>/designer/*/*_pinrpt_name.rpt
+before trusting any hardware measurement from it.
+
+### What this does NOT explain
+
+On the corrected rebuild - boots reliably in 24 s, mem / alu / pad all pass - GEMM still
+fails at every size, contributing exactly zero. GEMM also failed on the original Sep 12
+design, which was built correctly. So the I/O constraint bug is a separate (serious) flow
+bug, not the GEMM bug.
+
+Every hardware measurement taken between the first rebuild and this fix was made on a design
+with unconstrained I/O placement and should be treated as unreliable.

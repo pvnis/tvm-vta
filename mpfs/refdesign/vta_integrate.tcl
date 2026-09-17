@@ -107,21 +107,14 @@ build_design_hierarchy
 generate_component -component_name {MPFS_DISCOVERY_KIT} -recursive 1
 puts "VTA: integrated into $sd on ACLK (125 MHz), direct connections"
 
-# Re-derive timing constraints. The hierarchy has to be rebuilt after regenerating the top component, otherwise deriving
-# constraints cannot find the top level.
-build_design_hierarchy
-set_root -module {MPFS_DISCOVERY_KIT::work}
-derive_constraints_sdc
-# import_files copies the file into the project's constraint directory, which is the path
-# organize_tool_files expects; create_links would leave it outside the project.
-import_files -convert_EDN_to_HDL 0 -library {work} \
-    -sdc {/home/dmd/polarfire_sandbox/refdesign-vta/script_support/additional_configurations/vta/vta_clocks.sdc}
-foreach tool {SYNTHESIZE PLACEROUTE VERIFYTIMING} {
-    organize_tool_files -tool $tool \
-        -file {/home/dmd/polarfire_sandbox/refdesign-vta/MPFS_DISCOVERY/constraint/MPFS_DISCOVERY_KIT_derived_constraints.sdc} \
-        -file {/home/dmd/polarfire_sandbox/refdesign-vta/MPFS_DISCOVERY/constraint/vta_clocks.sdc} \
-        -module {MPFS_DISCOVERY_KIT::work} \
-        -input_type {constraint}
-}
+# NO constraint manipulation here. An earlier version called derive_constraints_sdc and
+# then organize_tool_files with only two SDC files, which REPLACES each tool's constraint
+# list - silently dropping all eight I/O PDCs and the floorplan PDC. The board's 50 MHz
+# oscillator constraint (set_io REF_CLK_50MHz -pin_name R18 -fixed true) was among them, so
+# the reference clock got auto-placed on another pin and the fabric came up without a usable
+# clock. That is what made every rebuilt design hang at "Initializing Mi-V IHC V2" - HSS's
+# first access to a fabric peripheral - and it was misread for weeks as CDC, PLL and timing
+# problems. The base design already derives and associates its constraints correctly; adding
+# VTA introduces no new clock, so there is nothing to add here.
 save_project
 puts "TCL_END: VTA integration"
