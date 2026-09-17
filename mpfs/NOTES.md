@@ -1181,3 +1181,189 @@ proven reliable. After a GEMM:
     register holds zero                 -> the write data itself is zero, fault is upstream
 That is a Chisel change plus a rebuild, but it gives permanent scriptable visibility instead
 of a one-off GUI session, and it uses the register path we know works.
+
+## The wedge has been masquerading as a GEMM bug (2026-09-17, later)
+
+A run of bias_probe on a freshly programmed fabric came back **64/64 correct - bias plus
+product**. gemm_probe identity then passed 64/64 as well. So the MAC array, the inp load,
+the wgt load and the accumulate all work. "GEMM contributes exactly zero", carried in these
+notes for weeks, is **wrong**.
+
+What actually happens is that VTA stops executing programs partway through a session, and a
+stopped VTA is indistinguishable from a broken computation if the only check is a comparison
+against a reference. Two conclusions recorded earlier today were measured on an already-
+stopped device and are hereby retracted:
+
+  - "one-hot weights pass, general weights fail" (gemm_probe posrandom/random) - the device
+    had wedged between the passing and failing runs.
+  - "the MAC array's MATH-block pairing is broken" (pair_probe) - every run after the first
+    left the sentinel untouched, i.e. executed nothing at all.
+
+hw_test's gemm results are suspect for the same reason: it fills the output with ZEROS, so
+"correct=9/256" is exactly what a never-executed run looks like when 9 reference values
+happen to be zero. **Any VTA test that does not pre-fill the output with a sentinel cannot
+tell a wrong answer from no answer.**
+
+### matrix.py
+
+New harness, and the one that should be used from now on. It builds and uploads several
+programs once, runs them over a single connection, and classifies every execution:
+
+    NOTRUN  output still holds the sentinel     -> VTA executed nothing
+    WRONG   output changed but differs from ref -> VTA ran and computed wrongly
+    ok      correct
+
+First run on a clean fabric (4 programs x 5 reps):
+
+    alu           {'ok': 5}
+    gemm-onehot   {'WRONG': 3, 'EXC': 2}      48/256 on each of the first three
+    gemm-pos      {'EXC': 5}
+    gemm-signed   {'EXC': 5}
+
+So: ALU is never wrong and never wedges. GEMM is wrong from the very first execution on a
+clean fabric, and after three executions the device wedges for good (EXC = the driver's
+10 s timeout, and it never recovers without reprogramming).
+
+The 48/256 is itself informative. In that test all four batch tiles get identical x and all
+four weight tiles identical one-hot w, so all sixteen output tiles should be identical.
+Exactly three are right. Identical inputs giving different answers depending on tile
+position is a pipelining symptom, not an arithmetic one.
+
+### Working hypothesis: LOAD/COMPUTE synchronisation
+
+One cause fits both symptoms. GEMM is the only program that makes the LOAD module (inp/wgt)
+run concurrently with COMPUTE; the ALU program never touches LOAD. If the producer/consumer
+dependency between them is broken, COMPUTE reads scratchpad tiles before LOAD has filled
+them (wrong tiles, and only at sizes where the pipeline actually overlaps - which is why the
+2x2 gemm_probe passed and the 4x4 does not), and the same dependency queues eventually
+deadlock (the sticky wedge).
+
+Next: VTA_DEBUG_FORCE_SERIAL (32) rewrites the dependencies so LOAD, COMPUTE and STORE never
+overlap. If that makes GEMM correct and stops the wedging, the fault is in the dependency
+logic rather than the datapath.
+
+### FORCE_SERIAL does not fix it - the synchronisation hypothesis is refuted
+
+Same matrix, clean fabric, debug_flag=0x20 (LOAD/COMPUTE/STORE never overlap):
+
+    alu           {'ok': 5}
+    gemm-onehot   {'WRONG': 1, 'EXC': 4}     48/256 on the first execution, as before
+    gemm-pos      {'EXC': 5}
+    gemm-signed   {'EXC': 5}
+
+The wrong answer is **bit-identical (48/256) with and without serialisation**, so it is
+deterministic, not a race between modules. Producer/consumer synchronisation is not the
+cause.
+
+(The `runtime.cc:963: not reached` that follows the first timeout is a separate, smaller
+bug of mine: VTADeviceRun returns 1 on timeout and the runtime's queue state is left
+inconsistent, so every later call fails differently. Worth fixing, but downstream.)
+
+### Next suspect: my own re-timing, on the ysize > 1 path
+
+The bitstream on the board contains the GenVMECmdWide re-timing (the generated Verilog has
+the new signals). Reading it back with fresh eyes, the re-timing changed `rdLineClNb` from a
+wire, combinational from the `rdLineElemBeginAddr` REGISTER, into a Reg **enabled by
+`stride`** - while `stride` is itself computed from `rdLineClNb`:
+
+    when((clReadIdx === rdLineClNb - rdLen) && (dramLineIdx =/= io.ysize - 1.U) && io.updateState) {
+      stride := true.B }
+
+Upstream broke that loop through the address register; my version interlocks the two. It is
+not a combinational loop (the dependence is through a register enable, so Chisel accepts it)
+but the equivalence argument in the comment only holds for the first line.
+
+That path is only exercised when **ysize > 1**, and this GEMM schedule loads x_buf strided
+over the batch axis, so **ysize = o**. Hence the prediction: o=1 unaffected, failures
+appearing as o grows. The 2x2 GEMM that genuinely passed had ysize=2; the 4x4 that fails has
+ysize=4. Test by sweeping o in TSIM, current RTL versus upstream RTL.
+
+### The failure is a clean function of o (= ysize on the inp transfer)
+
+Same program, same one-hot operands, same clean fabric, one execution each:
+
+    o=m=2   64/64 correct
+    o=m=4   0/256 - every tile all zeros, sentinel gone (so it DID execute and DID store)
+
+Not a wedge, not a race, not arithmetic: at o=4 the accelerator runs to completion and
+stores zeros. o is exactly the ysize of the strided inp DMA transfer, so this is the
+multi-line path of GenVMECmdWide.
+
+### ...but on hardware EVERY o fails, and TSIM passes every o
+
+    ysweep, TSIM, current RTL (the same RTL as the bitstream): o=1..6 all correct
+    ysweep, board, freshly reprogrammed:                       o=1..6 all zeros
+
+So ysize is not the variable either, and the re-timing is not a logic fault - the exact RTL
+in the bitstream computes every one of these correctly in Verilator. Hardware fails where
+simulation passes.
+
+Also checked and closed:
+
+  - Address dependence. pad_probe holds a dummy allocation of 0..1024 B to shift where the
+    operands land: all zeros at every padding. (Caveat: I did not verify the padding
+    actually moved the operands, so this is inconclusive rather than a clean negative.)
+  - Cache coherency. The driver maps the non-cached DDR alias at 0xC4000000 (a no-map
+    reserved region) with O_SYNC, so no cached alias of the operands exists. And the ALU
+    test reads its acc operand from that same pool correctly, so the DMA path works.
+  - A bitstream mix-up. MPFS_DISCOVERY and MPFS_DISCOVERY.retimed_ok have byte-identical
+    programming data (md5 2d4ce1ba, built 04:26 today), so the board this morning and the
+    board now run the same design.
+
+### What is actually left
+
+The COMPUTE module's acc DMA works (the ALU test depends on it and never fails). Only the
+LOAD module's inp/wgt DMA fails. The same LOAD logic is correct in Verilator. So the fault
+is in something Verilator does not model: the real AXI interconnect, or timing.
+
+And the ordering matters. On one boot this morning the 2x2 GEMM passed TWICE, the 4x4 then
+ran, and every GEMM after it failed - including a repeat of the 2x2 that had just worked.
+That is the shape of a device that gets poisoned by a large transfer and stays poisoned,
+not of a wrong computation. Testing that ordering directly (2x2, then 4x4, then 2x2 again,
+one process, fresh fabric) is the current experiment.
+
+### The register dump at the moment it stops
+
+From the board's own log when the driver's timeout fired:
+
+    no completion after 10000 ms (insn_count=61, insn at 0xc4400c00)
+    cycles 628 -> 628  (unchanged: no completion reported at all)
+    regs: 0x00=0x00000001 0x04=0x00000274 0x08=0x0000003d 0x0c=0xc4400c00
+          0x10..0x20 = 0
+
+Reading it:
+
+  - 0x00 = 1: the start bit is latched and readable, so the VCR (the AXI4Lite register
+    file) is alive and the driver's writes land.
+  - 0x04 frozen at 628 across a full 10 s wait. VTA is NOT stuck spinning on an AXI read
+    that never returns - in that case the cycle counter would keep climbing. It is not
+    running at all.
+  - 0x08 = 61 and 0x0c = 0xc4400c00 are exactly what the driver wrote.
+  - 0x10..0x20 = 0 is CORRECT, not a bug: the instructions carry absolute addresses
+    (LOAD wgt dram_base=12845063, elem=256 -> 12845063*256 = 0xc4000700) and baddr is
+    OR-ed in, so a zero base pointer is right.
+
+A live register interface with a dead core is a clock/reset symptom, not a logic one. The
+prime suspect is the reset tree: MSS_DLL_LOCKS is the AND of all four MSS FIC DLL locks and
+gates EXT_RST_N on every fabric CORERESET, so a momentary loss of any FIC DLL lock parks
+VTA in reset permanently while leaving the register file readable. That also explains why
+only reprogramming the FPGA recovers it - a Linux reboot does not reset the fabric.
+
+### The board degraded over the session
+
+    first matrix run today   alu ok x5, then GEMMs wrong/wedged
+    last matrix run today    alu ok x1, then EVERYTHING wedged - including the ALU
+
+Five FPGA reprogram cycles in one hour. The ALU path, which was solid all morning, now
+fails on its second execution. Measurements taken from here on are not trustworthy until
+the board has been properly power-cycled (reprogramming is not enough, and is what the
+session has been doing).
+
+### Where this leaves the GEMM question
+
+Honest summary: GEMM demonstrably WORKS on this hardware (bias_probe 64/64 = bias +
+product, gemm_probe 2x2 64/64). It is not an arithmetic or RTL fault - TSIM passes every
+size on the exact RTL in the bitstream. What breaks is that the accelerator stops, and it
+stops sooner the longer the board has been mistreated. The next measurement to take, on a
+freshly power-cycled board, is simply: how many executions does each program survive, using
+matrix.py, before the cycle counter freezes.
