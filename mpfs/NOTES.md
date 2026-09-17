@@ -1604,3 +1604,54 @@ even loaded, then an accumulating one:
 "Output is zero" therefore means instruction [5] contributed nothing, while the equivalent
 accumulate in bias_probe demonstrably worked (bias + product, 64/64). That asymmetry - not
 timing - is where the next investigation should start.
+
+### ...and the reset-vs-accumulate lead is dead too
+
+bias_probe, run as the FIRST program on a fresh fabric on the pipelined build:
+
+    == bias only (GEMM contributed nothing) : True
+    tile[0,0] got [100, 100, ... 100]      bias intact, product exactly 0
+
+So the accumulator DMA load works, the ALU add works, the store works, and the GEMM
+contributes zero - with the accumulator preloaded. There is no asymmetry between the
+reset-GEMM and the accumulating GEMM; bias_probe is simply intermittent like everything
+else. It returned bias+product at 14:02 and bias-only now, same program.
+
+### Where this actually stands
+
+Across THREE different bitstreams today - 125 MHz original, 100 MHz with CDC, 125 MHz with
+the inp->MAC path pipelined - the MAC array's contribution to the accumulator has been
+exactly zero, every time, except for one three-minute window at 14:02-14:05 when
+bias_probe and gemm_probe both returned fully correct results. That window is the only
+evidence that this hardware can do a GEMM at all, and nothing since has reproduced it.
+
+Everything around the MAC is proven working, repeatedly and on every build:
+
+    uop load, acc DMA load, ALU, acc write, out store   ALU test, always correct
+    inp/wgt DMA                                         cycle counts scale with weight volume
+    the MAC array exists in the netlist                 128 MATH blocks under tensorGemm/mvc_0
+    the RTL is functionally correct                     TSIM correct at every size, on RTL
+                                                        genuinely rebuilt from this source
+
+What has never been directly observed, in any experiment all day: whether the inp and wgt
+data actually ARRIVE in their scratchpads. Every test infers it from the GEMM result, which
+is precisely the thing that is broken. The remaining candidates all sit in that blind spot:
+
+  - inp scratchpad reads return zero (data never written, or read at the wrong address)
+  - wgt scratchpad reads return zero
+  - the MACC blocks are mis-configured by synthesis and multiply to zero
+
+### The one experiment that would settle it
+
+Add a read-only debug register to the VCR that latches what is being read out of the inp
+and wgt scratchpads, and read it from Linux over the control interface - which is the one
+path proven reliable on every build. After a GEMM:
+
+    register holds the expected operands -> the scratchpads are fine, the fault is the MACs
+    register holds zero                  -> the operands never arrive, the fault is upstream
+
+This was proposed at the start of the session and set aside for SmartDebug, which turned out
+not to be scriptable. It is now clearly the right move, and unlike then it is fully within
+reach: rebuild_rtl.sh makes RTL regeneration reproducible, run_sim.sh refuses stale RTL, and
+build_check.sh refuses a build with dropped constraints - so an instrumented bitstream can
+be produced and trusted in about two hours.
