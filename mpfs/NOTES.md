@@ -1463,3 +1463,51 @@ It still referenced a VTA_CTRL_BRIDGE component from the abandoned bridge attemp
 .prjx and smartgen/VTA_CTRL_BRIDGE_work.ixf - and Libero reported "Unable to find
 VTA_CTRL_BRIDGE.cxf" on every integration. Nothing instantiated it, but the base is now
 regenerated from scratch by full_100mhz.sh rather than reused.
+
+### The 100 MHz build closed
+
+    REF_CLK_50MHz -> R18                      (I/O constraints preserved this time)
+    worst VTA slack +2.586 ns  min period 7.279 ns  slow_lv_ht
+      from VTA/store/inst_q/ram_ram_0_2/INST_RAM1K20_IP:A_CLK
+      to   VTA/store/tensorStore/tensorStore/xrem[14]:D
+
+Against +0.139 ns at 125 MHz that is 18x the margin, and the critical path has moved
+entirely off the MAC array - the inp-scratchpad-to-multiplier path that caused this is no
+longer among the worst paths at all. The new worst path is in the STORE module, which the
+ALU test exercises constantly and which has never failed.
+
+The prediction to test, and it is falsifiable: matrix.py should show GEMM correct at every
+size, with no wedge. If GEMM is still wrong at 100 MHz with 2.6 ns of margin, then timing
+was not the whole story and the remaining suspect list is short.
+
+### The 100 MHz build did NOT fix it - and regressed the ALU
+
+Prediction was: GEMM correct at every size, no wedge. Result, on a freshly programmed
+board with +2.586 ns of VTA slack:
+
+    alu             {'ok': 2, 'EXC': 3}    wedges on the 3rd execution, never recovers
+    gemm-2x2        {'EXC': 5}
+    gemm-4x4        {'EXC': 5}
+    gemm-2x2-after  {'EXC': 5}
+
+The prediction is falsified. Worse, the ALU - solid 5/5 through every previous test at
+125 MHz - now wedges after two executions. Lowering a clock cannot make a previously
+reliable path fail, so this is a regression from the new TOPOLOGY, not from the frequency.
+
+So timing was not the whole story. The critical-path finding stands on its own evidence
+(the timing report is unambiguous about what the worst path is, and it explains the
+ALU/GEMM asymmetry), but it is evidently not sufficient.
+
+The wedge dump is the same shape as before and points at which half of the topology broke:
+
+    cycles 613 -> 613 unchanged, 0x00=0x1, register file answering
+
+The control path reaches VTA - register writes land and reads come back, and that path
+crosses S_CLK2. What is dead is instruction FETCH, which goes over the DMA path through
+M_CLK1. "Works twice, then never again" is what a CDC FIFO does when its two halves come
+out of reset inconsistently and it leaks an entry per program: VTA's ap_rst_n is released
+by VTA_RESET on PLL lock, while the interconnect's crossing logic is reset by ARESETN, and
+nothing orders those two events.
+
+Note the 100mhz.v2 build this wiring was copied from NEVER BOOTED, so it was never
+evidence that the wiring works - only evidence of what someone previously wrote.
