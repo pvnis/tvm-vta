@@ -74,6 +74,13 @@ hdl_core_add_bif -hdl_core_name {XilinxShell} -bif_definition {AXI4:AMBA:AMBA4:s
 "RRESP:s_axi_control_RRESP" }
 
 
+# A dedicated 100 MHz PLL for VTA. The 125 MHz build meets timing by 0.139 ns on the path
+# from the inp scratchpad LSRAM to the MAC array multiplier inputs (the design's own
+# max_timing report, slow_lv_ht), which is why GEMM is intermittently wrong on hardware
+# while the ALU - which never uses that path - is always correct. At 100 MHz that path is
+# not even critical: the previous 100 MHz build measured +1.853 ns worst VTA slack.
+source /home/dmd/polarfire_sandbox/refdesign-vta/script_support/additional_configurations/vta/VTA_CCC.tcl
+
 set sd FIC_0_PERIPHERALS
 open_smartdesign -sd_name $sd
 source /home/dmd/polarfire_sandbox/refdesign-vta/script_support/additional_configurations/vta/FIC0_INITIATOR.vta.tcl
@@ -81,22 +88,42 @@ sd_update_instance -sd_name $sd -instance_name {FIC0_INITIATOR}
 source /home/dmd/polarfire_sandbox/refdesign-vta/script_support/additional_configurations/vta/DMA_INITIATOR.vta.tcl
 sd_update_instance -sd_name $sd -instance_name {DMA_INITIATOR}
 
-# VTA is connected directly to the two system interconnects and runs on ACLK (FIC_0_CLK,
-# 125 MHz) - the topology of the known-good build.
+# VTA runs on its own 100 MHz clock and crosses into the 125 MHz FIC0 domain inside the
+# two CoreAXI4Interconnects, which is what SLAVE2_CLOCK_DOMAIN_CROSSING (the control port)
+# and MASTER1_CLOCK_DOMAIN_CROSSING (the DMA port) enable in the .vta.tcl parameter files
+# sourced above. Enabling CDC exposes one clock pin per crossed port - S_CLK2 and M_CLK1 -
+# and no per-port reset.
 #
-# Giving VTA a slower clock is still the right fix for the timing marginality, but every
-# route tried so far is blocked: enabling CLOCK_DOMAIN_CROSSING on ports of the SHARED
-# interconnects makes the board unbootable (three attempts, three different clock sources),
-# and moving the crossing into dedicated 1x1 bridges - Microchip's own VectorBlox topology -
-# fails at the control path, where SmartDesign rejects the connection between
-# FIC0_INITIATOR:AXI4mslave2 and the bridge's slave interface as "not compatible" even with
-# the signal sets, widths (ARADDR 38, ARID 8, ARLEN 8, ARUSER 1) and AXI4 types all matched.
-# The DMA-side bridge configures and connects fine; it is the control path that blocks.
+# The PLL's reference is ACLK (FIC_0_CLK), NOT the board's REF_CLK_50MHz pad: taking the pad
+# adds a second load to it, Libero then inserts a CLKINT buffer, and the MAIN CCC loses its
+# dedicated CCC_SW_CLKIN route - which changes the reference path of every FIC clock in the
+# design and stops the board booting.
+sd_instantiate_component -sd_name $sd -component_name {VTA_CCC} -instance_name {VTA_CCC_0}
+sd_connect_pins -sd_name $sd -pin_names {"ACLK" "VTA_CCC_0:REF_CLK_0"}
+
+# VTA needs a reset synchronised to its own clock and released once its PLL locks.
+# EXT_RST_N is ARESETN directly - deliberately NOT the MSS_DLL_LOCKS-gated reset that the
+# fabric CORERESETs in CLOCKS_AND_RESETS use.
+sd_instantiate_component -sd_name $sd -component_name {CORERESET} -instance_name {VTA_RESET}
+sd_connect_pins -sd_name $sd -pin_names {"VTA_CCC_0:OUT0_FABCLK_0" "VTA_RESET:CLK"}
+sd_connect_pins -sd_name $sd -pin_names {"ARESETN" "VTA_RESET:EXT_RST_N"}
+sd_connect_pins -sd_name $sd -pin_names {"VTA_CCC_0:PLL_LOCK_0" "VTA_RESET:PLL_LOCK"}
+sd_connect_pins_to_constant -sd_name $sd -pin_names {VTA_RESET:BANK_x_VDDI_STATUS} -value {VCC}
+sd_connect_pins_to_constant -sd_name $sd -pin_names {VTA_RESET:BANK_y_VDDI_STATUS} -value {VCC}
+sd_connect_pins_to_constant -sd_name $sd -pin_names {VTA_RESET:SS_BUSY} -value {GND}
+sd_connect_pins_to_constant -sd_name $sd -pin_names {VTA_RESET:INIT_DONE} -value {VCC}
+sd_connect_pins_to_constant -sd_name $sd -pin_names {VTA_RESET:FF_US_RESTORE} -value {GND}
+sd_connect_pins_to_constant -sd_name $sd -pin_names {VTA_RESET:FPGA_POR_N} -value {VCC}
+
 sd_instantiate_hdl_core -sd_name $sd -hdl_core_name {XilinxShell} -instance_name {VTA_0}
 sd_connect_pins -sd_name $sd -pin_names {"FIC0_INITIATOR:AXI4mslave2" "VTA_0:s_axi_control"}
 sd_connect_pins -sd_name $sd -pin_names {"VTA_0:m_axi_gmem" "DMA_INITIATOR:AXI4mmaster1"}
-sd_connect_pins -sd_name $sd -pin_names {"ACLK" "VTA_0:ap_clk"}
-sd_connect_pins -sd_name $sd -pin_names {"ARESETN" "VTA_0:ap_rst_n"}
+sd_connect_pins -sd_name $sd -pin_names {"VTA_CCC_0:OUT0_FABCLK_0" "VTA_0:ap_clk"}
+sd_connect_pins -sd_name $sd -pin_names {"VTA_RESET:FABRIC_RESET_N" "VTA_0:ap_rst_n"}
+
+# The interconnect side of each crossing runs on VTA's clock.
+sd_connect_pins -sd_name $sd -pin_names {"VTA_CCC_0:OUT0_FABCLK_0" "FIC0_INITIATOR:S_CLK2"}
+sd_connect_pins -sd_name $sd -pin_names {"VTA_CCC_0:OUT0_FABCLK_0" "DMA_INITIATOR:M_CLK1"}
 save_smartdesign -sd_name $sd
 build_design_hierarchy
 generate_component -component_name {FIC_0_PERIPHERALS} -recursive 1
@@ -105,16 +132,45 @@ generate_component -component_name {FIC_0_PERIPHERALS} -recursive 1
 # already receives.
 build_design_hierarchy
 generate_component -component_name {MPFS_DISCOVERY_KIT} -recursive 1
-puts "VTA: integrated into $sd on ACLK (125 MHz), direct connections"
+puts "VTA: integrated into $sd on its own 100 MHz clock, CDC in the interconnects"
 
-# NO constraint manipulation here. An earlier version called derive_constraints_sdc and
-# then organize_tool_files with only two SDC files, which REPLACES each tool's constraint
-# list - silently dropping all eight I/O PDCs and the floorplan PDC. The board's 50 MHz
-# oscillator constraint (set_io REF_CLK_50MHz -pin_name R18 -fixed true) was among them, so
-# the reference clock got auto-placed on another pin and the fabric came up without a usable
-# clock. That is what made every rebuilt design hang at "Initializing Mi-V IHC V2" - HSS's
-# first access to a fabric peripheral - and it was misread for weeks as CDC, PLL and timing
-# problems. The base design already derives and associates its constraints correctly; adding
-# VTA introduces no new clock, so there is nothing to add here.
+# Constraints. The new PLL introduces a clock that does not exist in the base design, so
+# derive_constraints_sdc MUST run or VTA's paths are analysed against nothing and the timing
+# report is meaningless.
+#
+# The trap here, which cost this project weeks: organize_tool_files REPLACES a tool's
+# constraint list rather than appending to it. An earlier version called it for PLACEROUTE
+# with only the two SDC files, silently dropping all the I/O PDCs - including the board's
+# 50 MHz oscillator assignment (set_io REF_CLK_50MHz -pin_name R18) - so the reference clock
+# was auto-placed on E12 and the fabric came up with no usable clock. Every rebuilt design
+# then hung at "Initializing Mi-V IHC V2", which was misread for weeks as CDC, PLL and
+# timing problems. The fix is not to skip the call, it is to pass the COMPLETE list.
+import_files -sdc {/home/dmd/polarfire_sandbox/refdesign-vta/script_support/additional_configurations/vta/vta_clocks.sdc}
+build_design_hierarchy
+derive_constraints_sdc
+
+set pd /home/dmd/polarfire_sandbox/refdesign-vta/MPFS_DISCOVERY
+set io_pdcs [list \
+    "$pd/constraint/io/MPFS_DISCOVERY_KIT_BANK_SETTINGS.pdc" \
+    "$pd/constraint/io/MPFS_DISCOVERY_KIT_BOARD_MISC.pdc" \
+    "$pd/constraint/io/MPFS_DISCOVERY_MAC.pdc" \
+    "$pd/constraint/io/MPFS_DISCOVERY_mikroBUS.pdc" \
+    "$pd/constraint/io/MPFS_DISCOVERY_RPi.pdc" \
+    "$pd/constraint/io/MPFS_DISCOVERY_UARTS.pdc" \
+    "$pd/constraint/io/MPFS_DISCOVERY_7_SEG.pdc" \
+    "$pd/constraint/fp/SW_PLL.pdc"]
+set sdcs [list \
+    "$pd/constraint/MPFS_DISCOVERY_KIT_derived_constraints.sdc" \
+    "$pd/constraint/vta_clocks.sdc"]
+
+# PLACEROUTE owns both kinds; the timing tools own only the SDCs.
+set args {}
+foreach f [concat $io_pdcs $sdcs] { lappend args -file $f }
+eval organize_tool_files -tool {PLACEROUTE} $args -module {MPFS_DISCOVERY_KIT::work} -input_type {constraint}
+set args {}
+foreach f $sdcs { lappend args -file $f }
+eval organize_tool_files -tool {SYNTHESIZE} $args -module {MPFS_DISCOVERY_KIT::work} -input_type {constraint}
+eval organize_tool_files -tool {VERIFYTIMING} $args -module {MPFS_DISCOVERY_KIT::work} -input_type {constraint}
+puts "VTA: constraints associated - [llength $io_pdcs] pdc + [llength $sdcs] sdc"
 save_project
 puts "TCL_END: VTA integration"

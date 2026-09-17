@@ -1417,3 +1417,49 @@ constraint-flow bug placed the board's 50 MHz oscillator on the wrong pin:
 
 So the clock-lowering approach was never actually tested. That bug is now removed from
 vta_integrate.tcl, so a 100 MHz build with correct I/O constraints is the fix.
+
+## The 100 MHz rebuild (2026-09-17, evening)
+
+vta_integrate.tcl now builds the fix rather than the known-good 125 MHz topology (the old
+one is kept at vta_integrate.tcl.125mhz.bak):
+
+  - VTA_CCC, a dedicated PLL at 100 MHz, referenced from ACLK (FIC_0_CLK) and NOT from the
+    REF_CLK_50MHz pad. Loading the pad twice makes Libero insert a CLKINT buffer, the main
+    CCC loses its dedicated CCC_SW_CLKIN route, and the board stops booting.
+  - CDC enabled on exactly the two interconnect ports VTA uses: SLAVE2_CLOCK_DOMAIN_CROSSING
+    on FIC0_INITIATOR (control) and MASTER1_CLOCK_DOMAIN_CROSSING on DMA_INITIATOR (DMA).
+    That exposes one clock pin per crossed port - S_CLK2 and M_CLK1, no per-port reset -
+    both driven from the new clock.
+  - A CORERESET for VTA's domain, released on PLL lock, with EXT_RST_N taken from ARESETN
+    directly - deliberately NOT the MSS_DLL_LOCKS-gated reset the other fabric resets use.
+  - vta_clocks.sdc declares VTA_vs_FIC0 asynchronous, so the timing engine does not try to
+    close paths through the CDC FIFOs that exist to make that unnecessary.
+
+The wiring above is not guesswork: it was recovered from the generated Verilog of the
+earlier MPFS_DISCOVERY.100mhz.v2 build, which had already solved it.
+
+### Constraints, done properly this time
+
+The new PLL introduces a clock the base design does not have, so derive_constraints_sdc MUST
+run - otherwise VTA's paths are analysed against nothing and the timing report looks clean
+and means nothing. The earlier bug was never that the call existed; it was that
+organize_tool_files REPLACES a tool's constraint list, and it was called with only two SDC
+files, dropping every I/O PDC including REF_CLK_50MHz -pin_name R18. So it is now called
+with the COMPLETE list: 8 pdc + 2 sdc for PLACEROUTE, the 2 sdc for SYNTHESIZE and
+VERIFYTIMING. The integration run confirms "constraints associated - 8 pdc + 2 sdc".
+
+### build_100mhz.sh checks instead of trusting
+
+Libero exits 0 after a failed step and only flushes its log at the end, so every step is
+followed by a grep for ^Error. Then two assertions before anything is programmed:
+
+    REF_CLK_50MHz must be placed on R18       (else the I/O constraints were dropped again)
+    the timing report must CONTAIN VTA paths  (an empty list means VTA's clock went
+                                               unconstrained and the build proves nothing)
+
+### MPFS_DISCOVERY.base was poisoned
+
+It still referenced a VTA_CTRL_BRIDGE component from the abandoned bridge attempt - its
+.prjx and smartgen/VTA_CTRL_BRIDGE_work.ixf - and Libero reported "Unable to find
+VTA_CTRL_BRIDGE.cxf" on every integration. Nothing instantiated it, but the base is now
+regenerated from scratch by full_100mhz.sh rather than reused.
