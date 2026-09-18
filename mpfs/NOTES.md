@@ -1655,3 +1655,28 @@ not to be scriptable. It is now clearly the right move, and unlike then it is fu
 reach: rebuild_rtl.sh makes RTL regeneration reproducible, run_sim.sh refuses stale RTL, and
 build_check.sh refuses a build with dropped constraints - so an instrumented bitstream can
 be produced and trusted in about two hours.
+
+## Board unreachable = check the Ethernet cable before anything else (2026-09-18)
+
+Symptom: ssh/ping to 192.168.100.2 dead, host `ip -br addr` shows eno1 DOWN.
+
+It is worth two minutes of diagnosis before assuming the board hung or the fabric broke,
+because the board can be perfectly healthy. The serial consoles tell you which it is:
+
+    /dev/ttyUSB1 (FlashPro5B)  HSS monitor, prompt ">>"   - present even while Linux runs,
+                                                            so ">>" alone means nothing
+    /dev/ttyUSB2 (FlashPro5C)  Linux console, login prompt
+
+Read one with:  stty -F /dev/ttyUSB2 115200 raw -echo; cat /dev/ttyUSB2
+(send a newline first - both are silent when idle).
+
+On 2026-09-18 the board was found fine: Linux up, systemd-networkd and vta-rpc both active,
+/etc/systemd/network/10-end0-static.network intact with Address=192.168.100.2/24. What was
+wrong was physical - `ethtool end0` reported "Link detected: no", and the host's eno1 showed
+NO-CARRIER as well. Both ends seeing NO-CARRIER means the cable, not the software. Nothing
+to fix on either machine; the static address reapplies by itself once carrier returns,
+because networkd holds it back until then.
+
+So: NO-CARRIER on both ends -> reconnect the cable. No reprogramming, no reboot, and in
+particular do not reprogram the FPGA "to fix networking" - that costs four minutes and
+resets the accelerator state you may have been about to measure.
