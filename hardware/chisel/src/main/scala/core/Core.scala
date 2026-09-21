@@ -114,6 +114,15 @@ class Core(implicit p: Parameters) extends Module {
   io.vcr.ecnt <> ecounters.io.ecnt
   io.vcr.ucnt <> ecounters.io.ucnt
   ecounters.io.acc_wr_event := compute.io.acc_wr_event
+  // Operand debug taps: DRAM beats into LOAD, and scratchpad data out to the GEMM.
+  ecounters.io.dbg_vme_inp.valid := io.vme.rd(2).data.fire
+  ecounters.io.dbg_vme_inp.bits := io.vme.rd(2).data.bits.data
+  ecounters.io.dbg_vme_wgt.valid := io.vme.rd(3).data.fire
+  ecounters.io.dbg_vme_wgt.bits := io.vme.rd(3).data.bits.data
+  ecounters.io.dbg_spad_inp.valid := load.io.inp.rd(0).data.valid
+  ecounters.io.dbg_spad_inp.bits := load.io.inp.rd(0).data.bits.asUInt
+  ecounters.io.dbg_spad_wgt.valid := load.io.wgt.rd(0).data.valid
+  ecounters.io.dbg_spad_wgt.bits := load.io.wgt.rd(0).data.bits.asUInt
 
   // Finish instruction is executed and asserts the VCR finish flag
   val finish = RegNext(compute.io.finish)

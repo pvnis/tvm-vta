@@ -20,6 +20,8 @@
 #include <tvm/runtime/module.h>
 #include <tvm/runtime/registry.h>
 #include <vta/driver.h>
+#include <cstdio>
+#include <cstdlib>
 #include <vta/dpi/module.h>
 
 #include "../vmem/virtual_memory.h"
@@ -154,6 +156,16 @@ class Device {
       if (val == 0x2) break;  // finish
     }
     prof_->Update(0, dpi_->ReadReg(0x04));
+    // Opt-in dump of the user counters (0x24: acc writes, 0x28..0x54: the operand debug
+    // taps in EventCounters), so the simulator reports the same registers that are read
+    // back from the board with devmem2 - giving the expected values to compare against.
+    if (getenv("VTA_DUMP_DBG") != nullptr) {
+      fprintf(stderr, "VTA_DBG");
+      for (uint32_t off = 0x24; off <= 0x54; off += 4) {
+        fprintf(stderr, " 0x%02x=0x%08x", off, dpi_->ReadReg(off));
+      }
+      fprintf(stderr, "\n");
+    }
     dpi_->SimWait();
   }
 

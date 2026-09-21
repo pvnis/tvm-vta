@@ -1704,3 +1704,36 @@ route is the consequence of no link, not a routing misconfiguration.
 Note the host has TWO RJ45 ports. The board must be on eno1 (the I219): the 192.168.100.1
 profile is bound to that interface name, and enp113s0 runs DHCP, which on a point-to-point
 cable to the board gets nothing - which would look exactly like a broken route table.
+
+## Operand debug taps (2026-09-21)
+
+The one thing no experiment had observed directly: do the GEMM operands actually reach the
+MAC array? Twelve read-only registers added after everything the driver uses (VCR ucnt,
+0x28..0x54; nothing existing moved), latched on finish like acc_wr_count at 0x24:
+
+    0x28..0x30  DRAM -> LOAD, inp   (VME rd 2)  beats, OR of all words, first word
+    0x34..0x3c  DRAM -> LOAD, wgt   (VME rd 3)  beats, OR, first word
+    0x40..0x48  scratchpad -> GEMM, inp          reads, OR, LAST word
+    0x4c..0x54  scratchpad -> GEMM, wgt          reads, OR, LAST word
+
+Scratchpad taps latch the LAST read because a reduction GEMM issues a reset-GEMM before the
+operands are loaded, and it reads the scratchpads too - random in Verilator, zero on the FPGA.
+Taps are registered before folding, so nothing lands on the scratchpad-to-MAC path.
+
+Tools: dbg_regs.py board (devmem2 over ssh) / dbg_regs.py tsim (TSIM driver prints the
+same registers with VTA_DUMP_DBG=1).
+
+Free datapoint before any rebuild: acc_wr_count (0x24) was always in the bitstream and never
+read. After one 2x2 GEMM on the board: 8 = 2 GEMM instructions x 4 tiles. Both GEMMs execute
+and write the accumulator; what they write is zero.
+
+TSIM reference, 2x2 identity GEMM (x = 1..16, one-hot w), correct 64/64:
+
+    acc_wr 8 | vme_inp 4 beats first 0x04030201 | vme_wgt 64 beats first 0x00000001
+    spad_inp 8 reads last 0x04030201 | spad_wgt 8 reads last 0x00000001
+
+Another stale-RTL trap, caught before it did damage: rebuild_rtl.sh removed the library and
+Verilator objects but not build/chisel/Test.DefaultPynqConfig.sv, whose make rule has no
+dependency on the sources - so the "rebuilt" library was the old RTL again. Found because
+the library came out byte-identical in size. rebuild_rtl.sh now deletes the generated .sv,
+and run_sim.sh's staleness guard compares sources against the .sv as well as the library.

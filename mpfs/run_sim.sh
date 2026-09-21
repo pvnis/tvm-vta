@@ -21,7 +21,10 @@ if [ ! -f "$LIB" ]; then
     echo "    cd $HW/hardware/chisel && VTA_HW_PATH=$HW PATH=$ROOT/tools/sbt/bin:\$PATH make lib CONFIG=DefaultPynqConfig" >&2
     exit 1
 fi
-NEWER=$(find "$HW/hardware/chisel/src" -name "*.scala" -newer "$LIB" -print -quit 2>/dev/null)
+# Compare against the GENERATED VERILOG, not just the library: the library can be rebuilt
+# from a stale Test.*.sv (whose make rule does not depend on the sources) and look fresh.
+SV=$HW/build/chisel/Test.DefaultPynqConfig.sv
+NEWER=$(find "$HW/hardware/chisel/src" -name "*.scala" \( -newer "$LIB" -o -newer "$SV" \) -print -quit 2>/dev/null)
 if [ -n "$NEWER" ]; then
     echo "[run_sim] REFUSING TO RUN: $LIB is older than the Chisel sources." >&2
     echo "[run_sim]   e.g. $NEWER" >&2

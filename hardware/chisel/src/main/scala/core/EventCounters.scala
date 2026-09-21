@@ -46,6 +46,13 @@ class EventCounters(debug: Boolean = false)(implicit p: Parameters) extends Modu
     val ecnt = Vec(vp.nECnt, ValidIO(UInt(vp.regBits.W)))
     val ucnt = Vec(vp.nUCnt, ValidIO(UInt(vp.regBits.W)))
     val acc_wr_event = Input(Bool())
+    // Operand debug taps (see the block at the end of this module).
+    val dbg_vme_inp = Flipped(ValidIO(UInt(p(ShellKey).memParams.dataBits.W)))
+    val dbg_vme_wgt = Flipped(ValidIO(UInt(p(ShellKey).memParams.dataBits.W)))
+    val dbg_spad_inp = Flipped(ValidIO(UInt(
+      (p(CoreKey).batch * p(CoreKey).blockIn * p(CoreKey).inpBits).W)))
+    val dbg_spad_wgt = Flipped(ValidIO(UInt(
+      (p(CoreKey).blockOut * p(CoreKey).blockIn * p(CoreKey).wgtBits).W)))
   })
   val cycle_cnt = RegInit(0.U(vp.regBits.W))
   when(io.launch && !io.finish) {
@@ -64,4 +71,50 @@ class EventCounters(debug: Boolean = false)(implicit p: Parameters) extends Modu
   }
   io.ucnt(0).valid := io.finish
   io.ucnt(0).bits := acc_wr_count
+
+  // Operand debug taps. On MPFS095T a GEMM runs to completion and writes the accumulator the
+  // expected number of times (acc_wr_count), yet the result is all zeros - while the same RTL
+  // in TSIM is correct. These say where along each operand's path the data turns into zeros:
+  //
+  //   vme_inp / vme_wgt    read beats arriving from DRAM for the LOAD module (VME rd 2/3)
+  //   spad_inp / spad_wgt  scratchpad read data handed to the GEMM
+  //
+  // Each stream gets three registers, reset at launch and latched on finish like the others:
+  //   count  beats (VME) or reads (scratchpad) with valid data
+  //   or     OR of every 32-bit word of every beat: zero means no nonzero bit was ever seen
+  //   sample the lowest 32-bit word of the FIRST beat (VME) or of the LAST read (scratchpad)
+  //
+  // Why last for the scratchpads: a GEMM with a reduction issues a reset-GEMM before the
+  // operands are loaded, and that GEMM reads the scratchpads too (uninitialised - zero on the
+  // FPGA, random in Verilator). The read that matters is the accumulate-GEMM's, which is the
+  // last. For the VME streams the first beat is the start of the operand, so first is right.
+  //
+  // The taps are registered before any folding, so none of this logic lands on the
+  // scratchpad-to-MAC path the timing work was about.
+  def tap(in: ValidIO[UInt], keepLast: Boolean): Seq[UInt] = {
+    val w = in.bits.getWidth
+    val v = RegNext(in.valid, false.B)
+    val d = RegNext(in.bits)
+    val words = (0 until (w + 31) / 32).map(i => d(math.min(w, 32 * i + 32) - 1, 32 * i))
+    val folded = words.reduce(_ | _)
+    val cnt = Reg(UInt(vp.regBits.W))
+    val orr = Reg(UInt(vp.regBits.W))
+    val first = Reg(UInt(vp.regBits.W))
+    val seen = Reg(Bool())
+    when(!io.launch || io.finish) {
+      cnt := 0.U; orr := 0.U; first := 0.U; seen := false.B
+    }.elsewhen(v) {
+      cnt := cnt + 1.U
+      orr := orr | folded
+      when(!seen || keepLast.B) { first := words(0); seen := true.B }
+    }
+    Seq(cnt, orr, first)
+  }
+  val dbg = Seq(tap(io.dbg_vme_inp, false), tap(io.dbg_vme_wgt, false),
+                tap(io.dbg_spad_inp, true), tap(io.dbg_spad_wgt, true)).flatten
+  require(dbg.length == vp.nUCnt - 1, "-F- nUCnt must be 1 + 12 debug registers")
+  for ((r, i) <- dbg.zipWithIndex) {
+    io.ucnt(i + 1).valid := io.finish
+    io.ucnt(i + 1).bits := r
+  }
 }
