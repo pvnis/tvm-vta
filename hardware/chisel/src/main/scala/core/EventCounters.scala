@@ -23,6 +23,7 @@ import chisel3._
 import chisel3.util._
 import vta.util.config._
 import vta.shell._
+import ISA._
 
 /** EventCounters.
  *
@@ -53,6 +54,9 @@ class EventCounters(debug: Boolean = false)(implicit p: Parameters) extends Modu
       (p(CoreKey).batch * p(CoreKey).blockIn * p(CoreKey).inpBits).W)))
     val dbg_spad_wgt = Flipped(ValidIO(UInt(
       (p(CoreKey).blockOut * p(CoreKey).blockIn * p(CoreKey).wgtBits).W)))
+    // Second set: what each LOAD tensor load was told to do, and what it asked VME for.
+    val dbg_start = Vec(2, Flipped(ValidIO(UInt(INST_BITS.W))))   // inp, wgt
+    val dbg_cmd = Vec(2, Flipped(ValidIO(new VMECmd)))             // inp, wgt
   })
   val cycle_cnt = RegInit(0.U(vp.regBits.W))
   when(io.launch && !io.finish) {
@@ -110,9 +114,32 @@ class EventCounters(debug: Boolean = false)(implicit p: Parameters) extends Modu
     }
     Seq(cnt, orr, first)
   }
+  // Second set, for inp then wgt (wgt loads correctly on the board, so it is the control):
+  //   start: count of load starts; FIRST start's xsize (low 16) | ysize (high 16); its dram_offset
+  //   cmd:   count of VME read commands; FIRST command's address; its len
+  // Together they separate "the load was told to read nothing" (a stale instruction, xsize 0,
+  // no data needed to finish) from "it asked for data and the data went elsewhere".
+  def sample(v: Bool, fields: Seq[UInt]): Seq[UInt] = {
+    val rv = RegNext(v, false.B)
+    val rf = fields.map(f => RegNext(f))
+    val cnt = Reg(UInt(vp.regBits.W))
+    val held = Seq.fill(fields.length)(Reg(UInt(vp.regBits.W)))
+    when(!io.launch || io.finish) {
+      cnt := 0.U; held.foreach(_ := 0.U)
+    }.elsewhen(rv) {
+      cnt := cnt + 1.U
+      when(cnt === 0.U) { held.zip(rf).foreach { case (h, f) => h := f } }
+    }
+    cnt +: held
+  }
+  val set2 = (0 until 2).flatMap { i =>
+    val d = io.dbg_start(i).bits.asTypeOf(new MemDecode)
+    sample(io.dbg_start(i).valid, Seq(Cat(d.ysize, d.xsize), d.dram_offset)) ++
+      sample(io.dbg_cmd(i).valid, Seq(io.dbg_cmd(i).bits.addr, io.dbg_cmd(i).bits.len))
+  }
   val dbg = Seq(tap(io.dbg_vme_inp, false), tap(io.dbg_vme_wgt, false),
-                tap(io.dbg_spad_inp, true), tap(io.dbg_spad_wgt, true)).flatten
-  require(dbg.length == vp.nUCnt - 1, "-F- nUCnt must be 1 + 12 debug registers")
+                tap(io.dbg_spad_inp, true), tap(io.dbg_spad_wgt, true)).flatten ++ set2
+  require(dbg.length == vp.nUCnt - 1, "-F- nUCnt must be 1 + 24 debug registers")
   for ((r, i) <- dbg.zipWithIndex) {
     io.ucnt(i + 1).valid := io.finish
     io.ucnt(i + 1).bits := r

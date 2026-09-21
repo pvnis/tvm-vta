@@ -10,6 +10,9 @@ and cleared when the next one launches - so they describe the LAST program run.
     0x34..0x3c          same for vme_wgt                               (VME rd 3)
     0x40..0x48          same for spad_inp: scratchpad reads handed to the GEMM
     0x4c..0x54          same for spad_wgt
+    0x58..0x6c  inp LOAD: starts, first start's ysize<<16|xsize and dram_offset (elements),
+                          VME commands, first command's byte address and AXI len (beats-1)
+    0x70..0x84  same for wgt (the control: wgt loads correctly on the board)
 
 An "or" of zero means that stream never carried a single nonzero bit.
 
@@ -26,6 +29,11 @@ NAMES = {0x24: "acc_wr"}
 for base, stream in ((0x28, "vme_inp"), (0x34, "vme_wgt"), (0x40, "spad_inp"), (0x4c, "spad_wgt")):
     for k, field in enumerate(("cnt", "or", "last" if stream.startswith("spad") else "first")):
         NAMES[base + 4 * k] = f"{stream}.{field}"
+# Second set: what each LOAD tensor load was told (first start) and asked VME for (first cmd).
+for base, t in ((0x58, "inp"), (0x70, "wgt")):
+    for k, field in enumerate(("start.cnt", "start.ysize|xsize", "start.dram_offset",
+                               "cmd.cnt", "cmd.addr", "cmd.len")):
+        NAMES[base + 4 * k] = f"{t}.{field}"
 
 
 def read_board(host="root@192.168.100.2"):

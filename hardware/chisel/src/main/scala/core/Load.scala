@@ -42,6 +42,8 @@ class Load(debug: Boolean = false)(implicit p: Parameters) extends Module {
     val vme_rd = Vec(2, new VMEReadMaster)
     val inp = new TensorClient(tensorType = "inp")
     val wgt = new TensorClient(tensorType = "wgt")
+    // Debug: the instruction each tensor load latches on its start cycle (see EventCounters).
+    val dbg_start = Vec(2, ValidIO(UInt(INST_BITS.W)))
   })
   val sIdle :: sSync :: sExe :: Nil = Enum(3)
   val state = RegInit(sIdle)
@@ -96,6 +98,8 @@ class Load(debug: Boolean = false)(implicit p: Parameters) extends Module {
   val tsor = Seq(io.inp, io.wgt)
   for (i <- 0 until 2) {
     tensorLoad(i).io.start := state === sIdle & start & tensorDec(i)
+    io.dbg_start(i).valid := tensorLoad(i).io.start
+    io.dbg_start(i).bits := inst_head.bits
     tensorLoad(i).io.inst := inst_head.bits
     tensorLoad(i).io.baddr := ptr(i)
     tensorLoad(i).io.tensor <> tsor(i)

@@ -123,6 +123,11 @@ class Core(implicit p: Parameters) extends Module {
   ecounters.io.dbg_spad_inp.bits := load.io.inp.rd(0).data.bits.asUInt
   ecounters.io.dbg_spad_wgt.valid := load.io.wgt.rd(0).data.valid
   ecounters.io.dbg_spad_wgt.bits := load.io.wgt.rd(0).data.bits.asUInt
+  ecounters.io.dbg_start <> load.io.dbg_start
+  for (i <- 0 until 2) {   // VME rd 2 = inp, 3 = wgt
+    ecounters.io.dbg_cmd(i).valid := io.vme.rd(2 + i).cmd.fire
+    ecounters.io.dbg_cmd(i).bits := io.vme.rd(2 + i).cmd.bits
+  }
 
   // Finish instruction is executed and asserts the VCR finish flag
   val finish = RegNext(compute.io.finish)
