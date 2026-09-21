@@ -1663,11 +1663,15 @@ Symptom: ssh/ping to 192.168.100.2 dead, host `ip -br addr` shows eno1 DOWN.
 It is worth two minutes of diagnosis before assuming the board hung or the fabric broke,
 because the board can be perfectly healthy. The serial consoles tell you which it is:
 
-    /dev/ttyUSB1 (FlashPro5B)  HSS monitor, prompt ">>"   - present even while Linux runs,
-                                                            so ">>" alone means nothing
-    /dev/ttyUSB2 (FlashPro5C)  Linux console, login prompt
+    /dev/ttyUSB-FlashPro5B  HSS monitor, prompt ">>"   - present even while Linux runs,
+                                                         so ">>" alone means nothing
+    /dev/ttyUSB-FlashPro5C  Linux console, login prompt
 
-Read one with:  stty -F /dev/ttyUSB2 115200 raw -echo; cat /dev/ttyUSB2
+Use these udev symlinks, NOT /dev/ttyUSBn: the numbers are reassigned at every host boot
+(on 09-18 the Linux console was ttyUSB2; after the 09-21 reboot it was ttyUSB0 and ttyUSB2
+had become the HSS monitor).
+
+Read one with:  stty -F /dev/ttyUSB-FlashPro5C 115200 raw -echo; cat /dev/ttyUSB-FlashPro5C
 (send a newline first - both are silent when idle).
 
 On 2026-09-18 the board was found fine: Linux up, systemd-networkd and vta-rpc both active,
@@ -1680,3 +1684,23 @@ because networkd holds it back until then.
 So: NO-CARRIER on both ends -> reconnect the cable. No reprogramming, no reboot, and in
 particular do not reprogram the FPGA "to fix networking" - that costs four minutes and
 resets the accelerator state you may have been about to measure.
+
+### 2026-09-21: "cannot ping when the cable is connected" - still physical, not routing
+
+Checked every layer on both machines; all correct:
+
+    host   eno1 <- netplan-eno1, manual 192.168.100.1/24. The other wired profile
+           ("Wired connection 1", DHCP) is bound to enp113s0 and cannot take eno1.
+           ufw inactive, INPUT policy ACCEPT, icmp_echo_ignore_all=0, rp_filter=2 (loose).
+    board  end0 <- 10-end0-static.network ([Match] Name=end0, 192.168.100.2/24);
+           eth.network matches eth* and cannot take end0.
+
+The 192.168.100.0/24 route is absent from the host table, but only because NetworkManager
+installs a connected route when the device gets carrier - and neither host port (eno1, I219,
+..:32; enp113s0, I210, ..:33) has had carrier since 09-18 15:38 per the NM journal, across
+two host reboots and a board power cycle. The board's end0 is NO-CARRIER as well. A missing
+route is the consequence of no link, not a routing misconfiguration.
+
+Note the host has TWO RJ45 ports. The board must be on eno1 (the I219): the 192.168.100.1
+profile is bound to that interface name, and enp113s0 runs DHCP, which on a point-to-point
+cable to the board gets nothing - which would look exactly like a broken route table.
