@@ -1864,3 +1864,31 @@ shape-specific; it accumulates across workloads in a process. The DMA pool is no
 too small - /proc/iomem confirms the full 64 MiB at 0xC4000000 is reserved, matching what
 the driver assumes - so the suspect is pool exhaustion or fragmentation across many
 allocations, or a leak in the driver's free list.
+
+## The single-process multi-layer crash does not reproduce (2026-09-25)
+
+All ten ResNet-18 conv layers now run in ONE process, three times in a row, 10/10 each:
+
+    C2 8.49 | C3 7.23 | C4 0.88 | C5 9.09 | C6 8.61 | C7 1.07
+    C8 10.14 | C9 9.81 | C10 1.24 | C11 10.92 GOPS
+
+**This was not fixed, it stopped happening.** The pool diagnostics added for it never fired,
+so DMA exhaustion - the leading hypothesis - was NOT the cause. What changed in between was
+build_board_runtime.sh rebuilding and redeploying libvta.so, whose only source change was
+those same diagnostics; they cannot fix a crash. So either the board had been running a
+stale libvta from before some earlier driver fix (unprovable now - the old binary is gone,
+and the board's clock is a day behind the host's, so timestamps prove nothing), or the
+original failure was transient state left by the reprogram-and-wedge sequence that
+immediately preceded it. Board and host libvta now agree (md5 c77f0de2f885).
+
+Worth keeping from the attempt: a real blind spot is closed. LOG(FATAL) in TVM THROWS, and
+VTAMemAlloc is extern "C", so the throw crosses a C ABI boundary and calls std::terminate -
+the process dies with the message trapped in an exception nobody catches. That is exactly
+why the original crash left NOTHING in the board's journal and the host saw only
+"connection reset by peer". The allocator now writes its state to stderr, unbuffered,
+BEFORE LOG(FATAL): pool size, bytes in use, block count, peak, free fragments, largest free
+block and the failing request. VTA_MPFS_POOL_LOG=1 reports occupancy on every alloc and
+free, which separates a leak (used climbing) from fragmentation (used flat, largest free
+block shrinking).
+
+If it returns, the failure will now explain itself instead of vanishing.

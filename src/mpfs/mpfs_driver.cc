@@ -51,6 +51,7 @@
 #include <cstring>
 #include <string>
 #include <ios>
+#include <algorithm>
 #include <mutex>
 #include <utility>
 #include <vector>
@@ -151,13 +152,39 @@ class MPFSDevice {
         free_.erase(it);
         if (rest) free_.emplace_back(off + size, rest);
         used_.emplace_back(off, size);
+        used_bytes_ += size;
+        if (used_bytes_ > peak_bytes_) peak_bytes_ = used_bytes_;
+        if (pool_log_) ReportPool("alloc");
         return dma_ + off;
       }
     }
+    // Report before dying. LOG(FATAL) throws, and this is reached through the extern "C"
+    // VTAMemAlloc, so the throw crosses a C ABI boundary and calls std::terminate - the
+    // process dies with nothing in the journal and the host sees only "connection reset by
+    // peer". Write the diagnosis straight to stderr first, unbuffered.
+    size_t largest = 0;
+    for (auto& f : free_) largest = std::max(largest, f.second);
+    fprintf(stderr,
+            "VTA: OUT OF DMA MEMORY. pool=%zu B at 0x%llx, in use=%zu B in %zu blocks "
+            "(peak %zu), free=%zu B in %zu fragments, largest free=%zu B, requested=%zu B\n",
+            dma_size_, static_cast<unsigned long long>(dma_phy_), used_bytes_, used_.size(),
+            peak_bytes_, dma_size_ - used_bytes_, free_.size(), largest, size);
+    fflush(stderr);
     LOG(FATAL) << "VTA: out of DMA memory (pool " << dma_size_ << " bytes at 0x"
                << std::hex << dma_phy_ << "); requested " << std::dec << size
+               << ", in use " << used_bytes_ << " in " << used_.size() << " blocks"
                << ". Enlarge the reserved region or set VTA_MPFS_DMA_SIZE.";
     return nullptr;
+  }
+
+  /*! \brief Pool occupancy, for spotting a leak or fragmentation across many kernels. */
+  void ReportPool(const char* what) {
+    size_t largest = 0;
+    for (auto& f : free_) largest = std::max(largest, f.second);
+    fprintf(stderr, "VTA pool %s: used=%zu B in %zu blocks (peak %zu), free frags=%zu, "
+            "largest free=%zu B\n", what, used_bytes_, used_.size(), peak_bytes_,
+            free_.size(), largest);
+    fflush(stderr);
   }
 
   void Free(void* buf) {
@@ -166,8 +193,10 @@ class MPFSDevice {
     for (auto it = used_.begin(); it != used_.end(); ++it) {
       if (it->first == off) {
         free_.emplace_back(off, it->second);
+        used_bytes_ -= it->second;
         used_.erase(it);
         Coalesce();
+        if (pool_log_) ReportPool("free ");
         return;
       }
     }
@@ -219,6 +248,8 @@ class MPFSDevice {
     close(fd);
     free_.emplace_back(0, dma_size_);
     debug_ = EnvU64("VTA_MPFS_DEBUG", 0) != 0;
+    // VTA_MPFS_POOL_LOG=1 reports pool occupancy on every allocation and free.
+    pool_log_ = EnvU64("VTA_MPFS_POOL_LOG", 0) != 0;
     if (debug_) {
       LOG(INFO) << "VTA mpfs: align=" << kAlign << " (wgt elem " << kWgtElemBytes
                 << ", acc " << kAccElemBytes << ", inp " << kInpElemBytes << ", out "
@@ -250,6 +281,8 @@ class MPFSDevice {
   uint64_t dma_phy_{0};
   size_t dma_size_{0};
   std::vector<std::pair<size_t, size_t> > free_, used_;
+  size_t used_bytes_{0}, peak_bytes_{0};
+  bool pool_log_{false};
   std::mutex mutex_;
 };
 
