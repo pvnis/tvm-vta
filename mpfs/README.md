@@ -87,6 +87,18 @@ One habit worth keeping: pre-fill the output with a sentinel value rather than z
 device that has stopped executing writes nothing, which is indistinguishable from computing
 zeros if the buffer started at zero. `matrix.py` does this for you.
 
+## Performance
+
+49 GOPS across the ten ResNet-18 conv layers, with VTA busy 91% of the wall time and hitting
+84% of its 64 GOPS peak while running (`perf_report.py` reports this per layer, pairing wall
+time with VTA's own cycle counter).
+
+Do not leave `VTA_MPFS_DEBUG=1` set on the RPC service. It logs one line per VTA instruction
+to the journal, synchronously, which costs about 78 us per instruction and made the same
+workload 6.6x slower (7.4 GOPS, VTA busy 14% of the time). It lives in a systemd drop-in,
+`/etc/systemd/system/vta-rpc.service.d/debug.conf`, currently parked at
+`/root/debug.conf.disabled`.
+
 ## Status
 
 Working. `mem`, `alu`, `pad` and `gemm` pass on hardware at every size tried, and all ten

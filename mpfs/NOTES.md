@@ -1932,3 +1932,45 @@ Levers in order: graph-level execution (7x, and nearly all of what is available,
 accelerator time is already near-optimal); autotuning (tophub has no mpfs entries, so these
 are fallback schedules); clock (+0.98 ns slack in hand); a wider MAC array last (128 of the
 part's 292 MATH blocks are used).
+
+## The per-call overhead was our own debug logging (2026-09-25)
+
+Profiling the board (no perf; gdb attach, sampling backtraces - and note `pgrep -x`, not
+`-f`, or the pattern matches the ssh command line and you profile a dead shell) showed all
+12 samples in the same place:
+
+    write() <- LogMessage::~LogMessage <- VTADeviceRun <- CommandQueue::Synchronize
+
+A systemd drop-in left from the instruction-corruption work, /etc/systemd/system/
+vta-rpc.service.d/debug.conf, set VTA_MPFS_DEBUG=1. With it on the driver writes ONE LINE
+PER VTA INSTRUCTION to the journal, synchronously: 17.5 ms / 223 instructions = 78 us per
+line, which is exactly the overhead that had been measured. Moved to
+/root/debug.conf.disabled; put it back to debug instructions again.
+
+    measure                 before    after
+    system GOPS               7.43    49.21
+    wall, all ten layers   176.3 ms  26.6 ms
+    VTA busy fraction          14%      91%
+    inferences/s               5.7     37.6
+
+    layer     MOP  wall ms   GOPS  busy ms  busy GOPS  MAC util  in VTA
+    C2      231.2     4.79  48.29     4.36      53.02       83%     91%
+    C3      115.6     2.38  48.68     2.24      51.52       81%     94%
+    C4       12.8     1.05  12.25     0.92      13.95       22%     88%
+    C5      231.2     4.43  52.17     4.00      57.78       90%     90%
+    C6      115.6     2.18  53.00     2.04      56.60       88%     94%
+    C7       12.8     0.74  17.46     0.62      20.56       32%     85%
+    C8      231.2     4.17  55.51     3.82      60.47       94%     92%
+    C9      115.6     2.08  55.69     1.96      58.90       92%     95%
+    C10      12.8     0.68  18.79     0.58      22.24       35%     85%
+    C11     231.2     4.14  55.88     3.77      61.39       96%     91%
+
+**This retires the graph-execution plan.** VTA is now busy 91% of the wall time, so the
+whole remaining per-call cost is 2.3 ms across ten layers - graph-level execution could
+recover at most ~9% (26.6 -> 24.3 ms), not the 7x estimated when the logging was on. Every
+performance number recorded before this point was measured with the logging enabled and
+understates the hardware by about 6.6x.
+
+What is left, in order: autotuning (tophub has no mpfs entries, so these are fallback
+schedules; MAC utilisation is 81-96% on 3x3 layers and 22-35% on 1x1, where there is more
+room); clock (+0.98 ns slack); a wider MAC array (128 of the part's 292 MATH blocks used).
