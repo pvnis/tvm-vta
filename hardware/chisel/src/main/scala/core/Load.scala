@@ -44,6 +44,8 @@ class Load(debug: Boolean = false)(implicit p: Parameters) extends Module {
     val wgt = new TensorClient(tensorType = "wgt")
     // Debug: the instruction each tensor load latches on its start cycle (see EventCounters).
     val dbg_start = Vec(2, ValidIO(UInt(INST_BITS.W)))
+    // Debug: every instruction LOAD dequeues from its own instruction queue.
+    val dbg_deq = ValidIO(UInt(INST_BITS.W))
   })
   val sIdle :: sSync :: sExe :: Nil = Enum(3)
   val state = RegInit(sIdle)
@@ -90,6 +92,8 @@ class Load(debug: Boolean = false)(implicit p: Parameters) extends Module {
   // instructions
   inst_q.io.enq <> io.inst
   inst_head.ready := (state === sExe & done) | (state === sSync)
+  io.dbg_deq.valid := inst_head.fire
+  io.dbg_deq.bits := inst_head.bits
 
   // load tensor
   // [0] input (inp)

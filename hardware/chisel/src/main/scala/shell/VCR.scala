@@ -34,8 +34,8 @@ case class VCRParams() {
   val nECnt = 1
   val nVals = 1
   val nPtrs = 6
-  // 1 = acc_wr_count (0x24). The other 24 are operand debug taps, see EventCounters.
-  val nUCnt = 25
+  // 1 = acc_wr_count (0x24). The other 50 are debug taps, see EventCounters.
+  val nUCnt = 51
   val regBits = 32
 }
 

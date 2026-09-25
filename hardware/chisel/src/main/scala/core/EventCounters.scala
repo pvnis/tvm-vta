@@ -57,6 +57,9 @@ class EventCounters(debug: Boolean = false)(implicit p: Parameters) extends Modu
     // Second set: what each LOAD tensor load was told to do, and what it asked VME for.
     val dbg_start = Vec(2, Flipped(ValidIO(UInt(INST_BITS.W))))   // inp, wgt
     val dbg_cmd = Vec(2, Flipped(ValidIO(new VMECmd)))             // inp, wgt
+    // Third set: instructions Fetch hands to LOAD, and instructions LOAD dequeues.
+    val dbg_ld_enq = Flipped(ValidIO(UInt(INST_BITS.W)))
+    val dbg_ld_deq = Flipped(ValidIO(UInt(INST_BITS.W)))
   })
   val cycle_cnt = RegInit(0.U(vp.regBits.W))
   when(io.launch && !io.finish) {
@@ -137,9 +140,30 @@ class EventCounters(debug: Boolean = false)(implicit p: Parameters) extends Modu
     sample(io.dbg_start(i).valid, Seq(Cat(d.ysize, d.xsize), d.dram_offset)) ++
       sample(io.dbg_cmd(i).valid, Seq(io.dbg_cmd(i).bits.addr, io.dbg_cmd(i).bits.len))
   }
+  // Third set: a trace of the first three raw 128-bit instructions (as four 32-bit words,
+  // least significant first) on each side of LOAD's instruction queue. On the board the
+  // inp load is never started while the wgt load right after it is, so the LOAD INP
+  // instruction is either corrupted (xsize 0 decodes as a sync no-op) or never arrives.
+  // Comparing the two traces with the instruction bytes in DRAM says which, and where.
+  def trace(in: ValidIO[UInt], n: Int): Seq[UInt] = {
+    val rv = RegNext(in.valid, false.B)
+    val rb = RegNext(in.bits)
+    val cnt = Reg(UInt(vp.regBits.W))
+    val words = Seq.fill(n * 4)(Reg(UInt(vp.regBits.W)))
+    when(!io.launch || io.finish) {
+      cnt := 0.U; words.foreach(_ := 0.U)
+    }.elsewhen(rv) {
+      cnt := cnt + 1.U
+      for (k <- 0 until n; w <- 0 until 4) {
+        when(cnt === k.U) { words(4 * k + w) := rb(32 * w + 31, 32 * w) }
+      }
+    }
+    cnt +: words
+  }
+  val set3 = trace(io.dbg_ld_enq, 3) ++ trace(io.dbg_ld_deq, 3)
   val dbg = Seq(tap(io.dbg_vme_inp, false), tap(io.dbg_vme_wgt, false),
-                tap(io.dbg_spad_inp, true), tap(io.dbg_spad_wgt, true)).flatten ++ set2
-  require(dbg.length == vp.nUCnt - 1, "-F- nUCnt must be 1 + 24 debug registers")
+                tap(io.dbg_spad_inp, true), tap(io.dbg_spad_wgt, true)).flatten ++ set2 ++ set3
+  require(dbg.length == vp.nUCnt - 1, "-F- nUCnt must be 1 + 50 debug registers")
   for ((r, i) <- dbg.zipWithIndex) {
     io.ucnt(i + 1).valid := io.finish
     io.ucnt(i + 1).bits := r

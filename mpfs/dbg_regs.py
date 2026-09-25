@@ -35,6 +35,39 @@ for base, t in ((0x58, "inp"), (0x70, "wgt")):
                                "cmd.cnt", "cmd.addr", "cmd.len")):
         NAMES[base + 4 * k] = f"{t}.{field}"
 
+# Third set: raw instruction traces on both sides of LOAD's instruction queue.
+for base, side in ((0x88, "ld_enq"), (0xbc, "ld_deq")):
+    NAMES[base] = f"{side}.cnt"
+    for k in range(3):
+        for w in range(4):
+            NAMES[base + 4 + 16 * k + 4 * w] = f"{side}[{k}].w{w}"
+
+MEM = {0: "uop", 1: "wgt", 2: "inp", 3: "acc", 4: "out"}
+OPS = {0: "LOAD", 1: "STORE", 2: "GEMM", 3: "FINISH", 4: "ALU"}
+
+
+def decode_inst(v):
+    f = lambda lo, n: (v >> lo) & ((1 << n) - 1)
+    op = f(0, 3)
+    s = f"{OPS.get(op, op)}"
+    if op in (0, 1):
+        s += (f" {MEM.get(f(7, 3), f(7, 3))} sram={f(10, 16)} dram={f(26, 32)} "
+              f"xsize={f(80, 16)} ysize={f(64, 16)} xstride={f(96, 16)}")
+    s += f" deps(pop_prev={f(3,1)} pop_next={f(4,1)} push_prev={f(5,1)} push_next={f(6,1)})"
+    return s
+
+
+def show_traces(regs):
+    for base, side, what in ((0x88, "ld_enq", "Fetch -> LOAD queue"),
+                             (0xbc, "ld_deq", "LOAD dequeued")):
+        n = regs.get(base)
+        if n is None:
+            continue
+        print(f"[dbg] {what}: {n} instruction(s); first {min(n, 3)}:")
+        for k in range(min(n, 3)):
+            v = sum(regs.get(base + 4 + 16 * k + 4 * w, 0) << (32 * w) for w in range(4))
+            print(f"[dbg]   [{k}] {v:032x}  {decode_inst(v)}")
+
 
 def read_board(host="root@192.168.100.2"):
     cmd = " ".join(f"devmem2 0x{BASE + off:08x} w | tail -1;" for off in sorted(NAMES))
@@ -54,7 +87,7 @@ def read_tsim(text):
 
 def show(regs, label):
     print(f"[dbg] {label}")
-    for off in sorted(NAMES):
+    for off in sorted(o for o in NAMES if o < 0x88):
         v = regs.get(off)
         note = ""
         if NAMES[off].endswith(".or") and v == 0:
@@ -65,6 +98,9 @@ def show(regs, label):
 if __name__ == "__main__":
     src = sys.argv[1] if len(sys.argv) > 1 else "board"
     if src == "board":
-        show(read_board(), "board")
+        r = read_board()
+        show(r, "board")
     else:
-        show(read_tsim(sys.stdin.read()), "tsim")
+        r = read_tsim(sys.stdin.read())
+        show(r, "tsim")
+    show_traces(r)
