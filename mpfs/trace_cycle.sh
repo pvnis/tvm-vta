@@ -16,4 +16,9 @@ echo "STEP: program + measure"
 # register dump that follows looks like data when it is really "nothing ran".
 ./run_hw.sh gemm_probe.py identity 1 > /tmp/trace_gemm.out 2>&1
 echo "gemm rc=$? $(grep -oE 'correct=[0-9]+/[0-9]+|Check failed: timeout' /tmp/trace_gemm.out | head -1)"
+echo "--- drive to the wedge ---"
+./run_hw.sh matrix.py 5 2>&1 | grep -E "^\[matrix\] (alu|gemm|execution|every)"
+echo "--- control reg + counters after that ---"
+ssh -n -o BatchMode=yes root@192.168.100.2 'printf "ctrl="; devmem2 0x60020000 w | tail -1 | sed "s/.*: //"'
+
 python3 dbg_regs.py board

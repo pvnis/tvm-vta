@@ -21,6 +21,7 @@ package vta.core
 
 import chisel3._
 import chisel3.util._
+import vta.util._
 import vta.util.config._
 import vta.shell._
 
@@ -44,7 +45,12 @@ class Store(debug: Boolean = false)(implicit p: Parameters) extends Module {
   val state = RegInit(sIdle)
 
   val s = Module(new Semaphore(counterBits = 8, counterInitValue = 0))
-  val inst_q = Module(new Queue(UInt(INST_BITS.W), p(CoreKey).instQueueEntries))
+  // SyncQueue, not Queue - same reason as Load.scala: a plain Chisel Queue is an
+  // asynchronous-read Mem, and at 512 x 128 bits PolarFire synthesis maps it into LSRAM,
+  // which reads synchronously, so instructions come out corrupted. In LOAD that produced
+  // silently skipped loads and hangs. STORE had not been caught misbehaving, but it is the
+  // same construct with the same depth.
+  val inst_q = Module(new SyncQueue(UInt(INST_BITS.W), p(CoreKey).instQueueEntries))
 
   val dec = Module(new StoreDecode)
   dec.io.inst := inst_q.io.deq.bits

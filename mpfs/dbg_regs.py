@@ -42,8 +42,10 @@ for base, side in ((0x88, "ld_enq"), (0xbc, "ld_deq")):
         for w in range(4):
             NAMES[base + 4 + 16 * k + 4 * w] = f"{side}[{k}].w{w}"
 
-NAMES[0xec] = "fetch.co_enq.cnt"
-NAMES[0xf0] = "fetch.st_enq.cnt"
+# These follow the two 13-register instruction traces, which end at 0xec.
+NAMES[0xf0] = "fetch.co_enq.cnt"
+NAMES[0xf4] = "fetch.st_enq.cnt"
+NAMES[0xf8] = "compute.finish.cnt"
 
 MEM = {0: "uop", 1: "wgt", 2: "inp", 3: "acc", 4: "out"}
 OPS = {0: "LOAD", 1: "STORE", 2: "GEMM", 3: "FINISH", 4: "ALU"}
@@ -90,7 +92,7 @@ def read_tsim(text):
 
 def show(regs, label):
     print(f"[dbg] {label}")
-    for off in sorted(o for o in NAMES if o < 0x88 or o >= 0xec):
+    for off in sorted(o for o in NAMES if o < 0x88 or o >= 0xf0):
         v = regs.get(off)
         note = ""
         if NAMES[off].endswith(".or") and v == 0:

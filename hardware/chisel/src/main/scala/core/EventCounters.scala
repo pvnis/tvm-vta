@@ -63,6 +63,12 @@ class EventCounters(debug: Boolean = false)(implicit p: Parameters) extends Modu
     val dbg_st_enq = Input(Bool())   // ... and to STORE, to catch a misrouted LOAD
     val dbg_ld_deq = Flipped(ValidIO(UInt(INST_BITS.W)))
   })
+  // Debug counters clear on the RISING EDGE of launch, not while launch is low. In the
+  // wedged state the control register is pinned to "done" and the driver's launch write is
+  // swallowed, so launch never rises - and a counter that clears while launch is low would
+  // read zero in exactly the state being investigated. Clearing on the edge keeps the last
+  // run's values AND lets anything still moving while launch is low be seen.
+  val launch_rise = io.launch && !RegNext(io.launch, init = false.B)
   val cycle_cnt = RegInit(0.U(vp.regBits.W))
   when(io.launch && !io.finish) {
     cycle_cnt := cycle_cnt + 1.U
@@ -110,7 +116,7 @@ class EventCounters(debug: Boolean = false)(implicit p: Parameters) extends Modu
     val orr = Reg(UInt(vp.regBits.W))
     val first = Reg(UInt(vp.regBits.W))
     val seen = Reg(Bool())
-    when(!io.launch || io.finish) {
+    when(launch_rise) {
       cnt := 0.U; orr := 0.U; first := 0.U; seen := false.B
     }.elsewhen(v) {
       cnt := cnt + 1.U
@@ -129,7 +135,7 @@ class EventCounters(debug: Boolean = false)(implicit p: Parameters) extends Modu
     val rf = fields.map(f => RegNext(f))
     val cnt = Reg(UInt(vp.regBits.W))
     val held = Seq.fill(fields.length)(Reg(UInt(vp.regBits.W)))
-    when(!io.launch || io.finish) {
+    when(launch_rise) {
       cnt := 0.U; held.foreach(_ := 0.U)
     }.elsewhen(rv) {
       cnt := cnt + 1.U
@@ -152,7 +158,7 @@ class EventCounters(debug: Boolean = false)(implicit p: Parameters) extends Modu
     val rb = RegNext(in.bits)
     val cnt = Reg(UInt(vp.regBits.W))
     val words = Seq.fill(n * 4)(Reg(UInt(vp.regBits.W)))
-    when(!io.launch || io.finish) {
+    when(launch_rise) {
       cnt := 0.U; words.foreach(_ := 0.U)
     }.elsewhen(rv) {
       cnt := cnt + 1.U
@@ -165,14 +171,14 @@ class EventCounters(debug: Boolean = false)(implicit p: Parameters) extends Modu
   def count(v: Bool): UInt = {
     val rv = RegNext(v, false.B)
     val c = Reg(UInt(vp.regBits.W))
-    when(!io.launch || io.finish) { c := 0.U }.elsewhen(rv) { c := c + 1.U }
+    when(launch_rise) { c := 0.U }.elsewhen(rv) { c := c + 1.U }
     c
   }
   val set3 = trace(io.dbg_ld_enq, 3) ++ trace(io.dbg_ld_deq, 3) ++
-    Seq(count(io.dbg_co_enq), count(io.dbg_st_enq))
+    Seq(count(io.dbg_co_enq), count(io.dbg_st_enq), count(io.finish))
   val dbg = Seq(tap(io.dbg_vme_inp, false), tap(io.dbg_vme_wgt, false),
                 tap(io.dbg_spad_inp, true), tap(io.dbg_spad_wgt, true)).flatten ++ set2 ++ set3
-  require(dbg.length == vp.nUCnt - 1, "-F- nUCnt must be 1 + 52 debug registers")
+  require(dbg.length == vp.nUCnt - 1, "-F- nUCnt must be 1 + 53 debug registers")
   // Update these registers EVERY cycle rather than only on finish. A program that hangs
   // never finishes, so latching on finish makes the whole dump read zero in exactly the
   // case worth investigating - which is what happened on 09-25. The counters still clear
