@@ -59,6 +59,8 @@ class EventCounters(debug: Boolean = false)(implicit p: Parameters) extends Modu
     val dbg_cmd = Vec(2, Flipped(ValidIO(new VMECmd)))             // inp, wgt
     // Third set: instructions Fetch hands to LOAD, and instructions LOAD dequeues.
     val dbg_ld_enq = Flipped(ValidIO(UInt(INST_BITS.W)))
+    val dbg_co_enq = Input(Bool())   // instructions Fetch routes to COMPUTE
+    val dbg_st_enq = Input(Bool())   // ... and to STORE, to catch a misrouted LOAD
     val dbg_ld_deq = Flipped(ValidIO(UInt(INST_BITS.W)))
   })
   val cycle_cnt = RegInit(0.U(vp.regBits.W))
@@ -76,7 +78,7 @@ class EventCounters(debug: Boolean = false)(implicit p: Parameters) extends Modu
   }.elsewhen (io.acc_wr_event) {
     acc_wr_count := acc_wr_count + 1.U
   }
-  io.ucnt(0).valid := io.finish
+  io.ucnt(0).valid := true.B   // continuous, see the note on the debug registers below
   io.ucnt(0).bits := acc_wr_count
 
   // Operand debug taps. On MPFS095T a GEMM runs to completion and writes the accumulator the
@@ -160,12 +162,23 @@ class EventCounters(debug: Boolean = false)(implicit p: Parameters) extends Modu
     }
     cnt +: words
   }
-  val set3 = trace(io.dbg_ld_enq, 3) ++ trace(io.dbg_ld_deq, 3)
+  def count(v: Bool): UInt = {
+    val rv = RegNext(v, false.B)
+    val c = Reg(UInt(vp.regBits.W))
+    when(!io.launch || io.finish) { c := 0.U }.elsewhen(rv) { c := c + 1.U }
+    c
+  }
+  val set3 = trace(io.dbg_ld_enq, 3) ++ trace(io.dbg_ld_deq, 3) ++
+    Seq(count(io.dbg_co_enq), count(io.dbg_st_enq))
   val dbg = Seq(tap(io.dbg_vme_inp, false), tap(io.dbg_vme_wgt, false),
                 tap(io.dbg_spad_inp, true), tap(io.dbg_spad_wgt, true)).flatten ++ set2 ++ set3
-  require(dbg.length == vp.nUCnt - 1, "-F- nUCnt must be 1 + 50 debug registers")
+  require(dbg.length == vp.nUCnt - 1, "-F- nUCnt must be 1 + 52 debug registers")
+  // Update these registers EVERY cycle rather than only on finish. A program that hangs
+  // never finishes, so latching on finish makes the whole dump read zero in exactly the
+  // case worth investigating - which is what happened on 09-25. The counters still clear
+  // at launch, so a dump read after a timeout describes the run that is stuck.
   for ((r, i) <- dbg.zipWithIndex) {
-    io.ucnt(i + 1).valid := io.finish
+    io.ucnt(i + 1).valid := true.B
     io.ucnt(i + 1).bits := r
   }
 }

@@ -127,6 +127,8 @@ class Core(implicit p: Parameters) extends Module {
   ecounters.io.dbg_ld_enq.valid := fetch.io.inst.ld.fire
   ecounters.io.dbg_ld_enq.bits := fetch.io.inst.ld.bits
   ecounters.io.dbg_ld_deq <> load.io.dbg_deq
+  ecounters.io.dbg_co_enq := fetch.io.inst.co.fire
+  ecounters.io.dbg_st_enq := fetch.io.inst.st.fire
   for (i <- 0 until 2) {   // VME rd 2 = inp, 3 = wgt
     ecounters.io.dbg_cmd(i).valid := io.vme.rd(2 + i).cmd.fire
     ecounters.io.dbg_cmd(i).bits := io.vme.rd(2 + i).cmd.bits

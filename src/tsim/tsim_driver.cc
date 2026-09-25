@@ -161,7 +161,7 @@ class Device {
     // back from the board with devmem2 - giving the expected values to compare against.
     if (getenv("VTA_DUMP_DBG") != nullptr) {
       fprintf(stderr, "VTA_DBG");
-      for (uint32_t off = 0x24; off <= 0xec; off += 4) {
+      for (uint32_t off = 0x24; off <= 0xf0; off += 4) {
         fprintf(stderr, " 0x%02x=0x%08x", off, dpi_->ReadReg(off));
       }
       fprintf(stderr, "\n");
