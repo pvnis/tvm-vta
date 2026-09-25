@@ -18,6 +18,7 @@ MPFS095T Discovery Kit with VTA in the fabric behind FIC0. No kernel module is n
 | `conv_probe.py` | real ResNet-18 conv2d layers through the full TVM stack (`CONV_ONLY=C11` for one) |
 | `gemm_probe.py`, `bias_probe.py`, `ysweep.py`, `pad_probe.py`, `wedge_stress.py` | targeted probes |
 | `dbg_regs.py` | decode VTA's debug registers, from the board (`board`) or from TSIM (`tsim`) |
+| `perf_report.py` | per-layer wall time vs VTA's cycle counter: GOPS, MAC utilisation, busy fraction |
 | `trace_cycle.sh` | regenerate RTL, rebuild the bitstream, program, measure - unattended |
 | `refdesign/` | the Libero flow: integration tcl, build scripts, component configs |
 | `NOTES.md` | the running record: what was tried, what was measured, what was retracted |
@@ -101,18 +102,23 @@ workload 6.6x slower (7.4 GOPS, VTA busy 14% of the time). It lives in a systemd
 
 ## Status
 
-Working. `mem`, `alu`, `pad` and `gemm` pass on hardware at every size tried, and all ten
-ResNet-18 conv2d layers pass through the full TVM stack, 8.4 to 10.9 GOPS on the 3x3 layers
-(the 1x1 layers run near 1 GOPS: they move nearly as much data for a ninth of the
-arithmetic). 60 consecutive executions run correctly with no wedge.
+Working. `mem`, `alu`, `pad` and `gemm` pass on hardware at every size tried; all ten
+ResNet-18 conv2d layers pass through the full TVM stack, individually and all in one
+process; 60 consecutive executions run correctly with no wedge. See Performance above for
+the numbers.
 
 The long-standing "GEMM returns zeros" and "the device stops accepting work" faults had a
 single cause: LOAD and STORE each used a plain Chisel `Queue` for their instruction queue.
 That is an asynchronous-read `Mem`, and at 512 x 128 bits PolarFire synthesis maps it into
-LSRAM, which can only read synchronously - so instructions came out corrupted. Both now use
-`SyncQueue`, which COMPUTE always used. See `NOTES.md`.
+LSRAM, which can only read synchronously - so instructions came out corrupted. `xsize`
+corrupted to 0 decodes as a sync, silently skipping the load (all-zero GEMM results);
+`ysize` corrupted to 0 hangs the command generator. Both modules now use `SyncQueue`, which
+COMPUTE always used. See `NOTES.md`.
 
-Known issue: running all ten conv layers in ONE process kills the RPC server part way,
-while each passes on its own, so something accumulates across workloads in a process
-(pool fragmentation or a leak in the driver's free list is the current suspect). Run one
-layer per process with `CONV_ONLY=` until that is fixed.
+Earlier note here said running all ten conv layers in one process killed the RPC server.
+That no longer reproduces - three consecutive full runs pass - and the DMA pool diagnostics
+added for it never fired, so exhaustion was not the cause. It was most likely a stale
+`libvta.so` on the board. The diagnostics stay: `LOG(FATAL)` throws, and `VTAMemAlloc` is
+`extern "C"`, so a throw there hits `std::terminate` and the message is lost - which is why
+that crash left nothing in the journal. The allocator now writes its state to stderr first,
+and `VTA_MPFS_POOL_LOG=1` reports occupancy per allocation.
