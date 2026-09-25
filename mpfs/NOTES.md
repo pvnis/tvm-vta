@@ -1787,3 +1787,49 @@ corruption and is now the top remaining issue.
 
 STORE also uses a plain Queue (Store.scala) and has the same latent bug. It has not misbehaved
 yet, but it is the same construct and is a candidate both for the wedge and for a robustness fix.
+
+## BOTH BUGS FIXED - VTA is working (2026-09-25)
+
+Switching STORE to SyncQueue as well removed the wedge. Same root cause as the GEMM
+corruption: a plain Chisel Queue is an asynchronous-read Mem, and at 512 x 128 bits
+PolarFire synthesis maps it into LSRAM, which can only read synchronously.
+
+    Load.scala   new Queue(...) -> new SyncQueue(...)    fixed wrong/zero GEMM results
+    Store.scala  new Queue(...) -> new SyncQueue(...)    fixed the wedge
+
+Why a corrupted STORE instruction wedged the device: the VCR gives io.vcr.finish priority
+over host writes to the control register, so once finish is stuck asserted the launch bit
+can never be set again. The driver writes launch, immediately reads back "done", and every
+call returns having run nothing. Measured before the fix: ctrl reads 0x2 and writing 1 does
+not stick.
+
+### Results after both fixes
+
+    matrix.py, 4 programs x 15 reps, one process, fresh fabric:
+      alu {'ok': 15}   gemm-2x2 {'ok': 15}   gemm-4x4 {'ok': 15}   gemm-2x2-again {'ok': 15}
+      60 executions, every one correct, no wedge
+
+    hw_test: mem PASS | alu PASS | gemm red=1 PASS | gemm red=4 PASS | gemm red=16 PASS
+
+Previous builds stopped accepting work after 9 to 14 programs.
+
+Worst VTA slack improved to +0.980 ns (min period 6.885 ns, slow_lv_ht) - SyncQueue maps
+onto LSRAM cleanly instead of fighting the inference.
+
+The debug counters now agree with TSIM on every field: inp.start xsize=2 ysize=1,
+dram_offset x 16 == the AXI address subsequently requested (0xC4800C00), cmd len 3,
+6 compute instructions, 1 store, 1 finish per program.
+
+### What this retires
+
+  - "GEMM contributes exactly zero" - it was a silently skipped load: xsize corrupted to 0
+    decodes as a sync, so no inp data was ever fetched.
+  - The timing work (re-timing, 100 MHz, scratchpadReadLatency) - real improvements to real
+    critical paths, but never the cause. They changed which bits got corrupted, which is why
+    the symptom kept moving.
+  - The intermittency, the three-minute window when GEMM worked, and the sticky wedge: all
+    one root cause.
+
+The instruments that made this findable: matrix.py (classifies every execution
+NOTRUN/WRONG/ok), the VCR debug taps plus mpfs/dbg_regs.py, run_sim.sh refusing stale RTL,
+and build_check.sh refusing a build with dropped I/O constraints.
