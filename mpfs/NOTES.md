@@ -1737,3 +1737,53 @@ Verilator objects but not build/chisel/Test.DefaultPynqConfig.sv, whose make rul
 dependency on the sources - so the "rebuilt" library was the old RTL again. Found because
 the library came out byte-identical in size. rebuild_rtl.sh now deletes the generated .sv,
 and run_sim.sh's staleness guard compares sources against the .sv as well as the library.
+
+## ROOT CAUSE FOUND AND FIXED: LOAD's instruction queue corrupted instructions (2026-09-25)
+
+The live debug registers caught it on a hung GEMM - the same instruction measured at LOAD's
+input port and at its instruction-queue output:
+
+    Fetch -> LOAD:      LOAD inp xsize=2 ysize=1 dram=205520912    correct
+    tensor load start:  LOAD inp xsize=2 ysize=0 dram=205520896    corrupted
+
+Only LOAD's instruction queue sits between those taps. It was a plain Chisel Queue, which is
+an ASYNCHRONOUS-read Mem; PolarFire synthesis maps that into LSRAM, which can only read
+synchronously, so the instruction presented at the output does not match what was written.
+
+    Load.scala:   val inst_q = Module(new Queue(...))      ->  new SyncQueue(...)
+
+This accounts for the entire history of the problem:
+
+  - xsize corrupted to 0 decodes as a SYNC (LoadDecode: isSync = LINP|LWGT with xsize==0),
+    so the load is silently skipped and no data is fetched. That is why the inp scratchpad
+    stayed zero, every GEMM returned exactly zero, and the wgt load right after it was fine.
+  - ysize corrupted to 0 hangs the command generator, which finishes at line index
+    ysize-1 = 65535: no command is ever issued (inp.cmd.cnt = 0) and the program never
+    completes. That was the deterministic 3/3 hang on the trace build.
+  - Different bits corrupt in different builds, which is why the symptom kept changing -
+    all zeros, hangs, one three-minute window of correct results - and why the timing work
+    moved the symptom around without ever fixing it.
+  - The ALU always passed because it needs no LOAD instruction at all.
+  - COMPUTE's uop/acc loads never failed because Compute.scala already used SyncQueue.
+
+### Hardware results with the fix
+
+    mem PASS | alu PASS | gemm red=1 PASS | gemm red=4 PASS | gemm red=16 PASS
+
+gemm red=16 is 4x256 . 256x64 - the largest, and it has never passed before.
+
+### Still open: the wedge
+
+matrix.py, 4 programs x 5 reps on a fresh fabric:
+
+    alu            {'ok': 5}
+    gemm-2x2       {'ok': 3, 'NOTRUN': 2}
+    everything after execution 9: NOTRUN, 20 executions in 0.2 s
+
+So results are CORRECT until the device stops accepting work, at around the ninth program.
+After that, calls return instantly having done nothing (the "reports done immediately"
+variant rather than the older hang). This is a separate bug from the instruction
+corruption and is now the top remaining issue.
+
+STORE also uses a plain Queue (Store.scala) and has the same latent bug. It has not misbehaved
+yet, but it is the same construct and is a candidate both for the wedge and for a robustness fix.
