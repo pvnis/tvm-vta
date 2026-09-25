@@ -21,6 +21,7 @@ package vta.core
 
 import chisel3._
 import chisel3.util._
+import vta.util._
 import vta.util.config._
 import vta.shell._
 
@@ -51,7 +52,15 @@ class Load(debug: Boolean = false)(implicit p: Parameters) extends Module {
   val state = RegInit(sIdle)
 
   val s = Module(new Semaphore(counterBits = 8, counterInitValue = 0))
-  val inst_q = Module(new Queue(UInt(INST_BITS.W), p(CoreKey).instQueueEntries))
+  // SyncQueue, not Queue. A plain Chisel Queue is an asynchronous-read Mem, and on
+  // PolarFire synthesis maps it into LSRAM, which can only read synchronously - so the
+  // instruction presented at the queue output does not match what was written. Measured on
+  // the board: Fetch enqueued LOAD inp xsize=2 ysize=1 dram=205520912 and the tensor load
+  // started with ysize=0 dram=205520896, which hangs the command generator (it finishes at
+  // line index ysize-1 = 65535). An earlier build corrupted xsize to 0 instead, which
+  // decodes as a sync and silently skips the load - that is why inp data never arrived
+  // while wgt did. COMPUTE has always used SyncQueue and its uop/acc loads never failed.
+  val inst_q = Module(new SyncQueue(UInt(INST_BITS.W), p(CoreKey).instQueueEntries))
   // PolarFire timing fix: register the head of the instruction queue so the RAM read
   // is not in series with instruction decode + DMA address arithmetic (was the only
   // failing path cone at 125 MHz on MPFS095T). Adds 1 cycle per instruction.
