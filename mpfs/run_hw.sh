@@ -9,4 +9,6 @@ PY
 export VTA_HW_PATH=$HW TVM_LIBRARY_PATH=$ROOT/tvm/build
 export PYTHONPATH=$ROOT/tvm/python:$ROOT/tvm/vta/python
 export PATH=$ROOT/venv/bin:$PATH
+# The stock VTA test helpers (vta.testing.run) locate the board through these.
+export VTA_RPC_HOST=${VTA_RPC_HOST:-192.168.100.2} VTA_RPC_PORT=${VTA_RPC_PORT:-9091}
 exec python "$@"

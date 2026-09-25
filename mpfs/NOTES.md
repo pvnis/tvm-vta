@@ -1833,3 +1833,34 @@ dram_offset x 16 == the AXI address subsequently requested (0xC4800C00), cmd len
 The instruments that made this findable: matrix.py (classifies every execution
 NOTRUN/WRONG/ok), the VCR debug taps plus mpfs/dbg_regs.py, run_sim.sh refusing stale RTL,
 and build_check.sh refusing a build with dropped I/O constraints.
+
+## End to end: all ten ResNet-18 conv2d layers run on the board (2026-09-25)
+
+conv_probe.py is VTA's own test_benchmark_topi_conv2d with two board-specific changes:
+export a shared library with the riscv64 cross compiler instead of saving a .o for the RPC
+server to link, and skip program_fpga (the fabric is programmed over JTAG, and no prebuilt
+bitstream exists for this config). CONV_ONLY=<name> runs a single layer.
+
+Full TVM stack: TOPI conv2d, the tuned VTA schedule, padding, bias, right shift, clip and
+cast, checked against a numpy reference.
+
+    C2   56x56  64->64   3x3      8.43 GOPS
+    C3   56x56  64->128  3x3 /2   7.21
+    C4   56x56  64->128  1x1 /2   0.87
+    C5   28x28 128->128  3x3      9.14
+    C6   28x28 128->256  3x3 /2   8.58
+    C7   28x28 128->256  1x1 /2   1.06
+    C8   14x14 256->256  3x3     10.17
+    C9   14x14 256->512  3x3 /2   9.75
+    C10  14x14 256->512  1x1 /2   1.23
+    C11   7x7  512->512  3x3     10.87
+
+The 1x1 layers are an order of magnitude slower because they move nearly as much data for a
+ninth of the arithmetic - DMA bound, not compute bound.
+
+Known issue: running all ten in ONE process kills the RPC server part way (connection reset
+by peer, nothing in the board's journal). Each layer passes on its own, so it is not
+shape-specific; it accumulates across workloads in a process. The DMA pool is not obviously
+too small - /proc/iomem confirms the full 64 MiB at 0xC4000000 is reserved, matching what
+the driver assumes - so the suspect is pool exhaustion or fragmentation across many
+allocations, or a leak in the driver's free list.
