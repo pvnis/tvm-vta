@@ -1892,3 +1892,43 @@ free, which separates a leak (used climbing) from fragmentation (used flat, larg
 block shrinking).
 
 If it returns, the failure will now explain itself instead of vanishing.
+
+## Performance, measured (2026-09-25)
+
+perf_report.py runs each layer on its own and pairs the test's wall time with VTA's own
+cycle counter (reg 0x04 = the last launch's cycles), so accelerator time and system time can
+be told apart.
+
+    peak = 64 GOPS (16x16 MACs, 2 ops each, 125 MHz)
+
+    layer     MOP  wall ms   GOPS  busy ms  busy GOPS  MAC util  in VTA
+    C2      231.2    27.45   8.42     4.36      53.01       83%     16%
+    C3      115.6    16.09   7.19     2.24      51.63       81%     14%
+    C4       12.8    14.73   0.87     0.92      13.96       22%      6%
+    C5      231.2    25.45   9.08     4.00      57.78       90%     16%
+    C6      115.6    13.51   8.56     2.04      56.57       88%     15%
+    C7       12.8    12.16   1.06     0.63      20.49       32%      5%
+    C8      231.2    22.77  10.15     3.82      60.46       94%     17%
+    C9      115.6    11.90   9.71     1.96      58.90       92%     16%
+    C10      12.8    10.99   1.17     0.58      22.03       34%      5%
+    C11     231.2    21.28  10.87     3.77      61.39       96%     18%
+
+    total 1310 MOP, wall 176.3 ms -> 7.43 GOPS
+    busy 24.3 ms (14% of wall) -> 53.85 GOPS while busy = 84% of peak
+
+The accelerator is fine: 84% of peak while running, 96% on C11. It is busy only 14% of the
+wall time. The rest is per-call host work on the U54 - the runtime rebuilds the instruction
+and uop streams and copies them into the DMA pool on every invocation.
+
+Utilisation RISES as spatial size shrinks and channels grow (C2 83% -> C11 96%): fewer,
+larger tiles mean fewer instructions per unit of arithmetic. The 1x1 layers at 22-34% are
+inherent, not a fault - they move nearly as much data for a ninth of the work.
+
+These ten layers: 176 ms today (5.7 inferences/s); 24 ms (41/s) if the per-call cost were
+amortised. That 7x needs no hardware change, and is now unblocked since multi-layer runs in
+one process work.
+
+Levers in order: graph-level execution (7x, and nearly all of what is available, since the
+accelerator time is already near-optimal); autotuning (tophub has no mpfs entries, so these
+are fallback schedules); clock (+0.98 ns slack in hand); a wider MAC array last (128 of the
+part's 292 MATH blocks are used).
