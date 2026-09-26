@@ -1974,3 +1974,47 @@ understates the hardware by about 6.6x.
 What is left, in order: autotuning (tophub has no mpfs entries, so these are fallback
 schedules; MAC utilisation is 81-96% on 3x3 layers and 22-35% on 1x1, where there is more
 room); clock (+0.98 ns slack); a wider MAC array (128 of the part's 292 MATH blocks used).
+
+## RISC-V CPU vs VTA on the same board (2026-09-26)
+
+compare_cpu_vta.py runs each ResNet-18 conv layer twice - once on the four U54 cores, once
+on VTA - through the same TVM stack, checking correctness on both. conv_probe.py gained a
+CPU path: the stock test keys its CPU branch on "arm_cpu", but this board's CPU target has
+keys ("cpu",), so it never fired. It uses topi's arm_cpu spatial-pack schedule, which is
+plain loop tiling and vectorisation over TE with no Arm intrinsics and so applies to any
+CPU; the generic schedule does no tiling at all and would flatter VTA unfairly
+(CONV_CPU_GENERIC=1 selects it if needed).
+
+    layer     MOP |    CPU ms CPU GOPS |   VTA ms VTA GOPS | speedup
+    C2      231.2 |     286.5     0.81 |     4.75    48.67 |     60x
+    C3      115.6 |     153.3     0.75 |     2.38    48.61 |     64x
+    C4       12.8 |      15.7     0.82 |     1.06    12.16 |     15x
+    C5      231.2 |     294.9     0.78 |     4.47    51.73 |     66x
+    C6      115.6 |     222.9     0.52 |     2.17    53.31 |    103x
+    C7       12.8 |      25.6     0.50 |     0.74    17.26 |     34x
+    C8      231.2 |     448.4     0.52 |     4.15    55.70 |    108x
+    C9      115.6 |     230.5     0.50 |     2.08    55.52 |    111x
+    C10      12.8 |      25.4     0.51 |     0.69    18.66 |     37x
+    C11     231.2 |     459.8     0.50 |     4.10    56.45 |    112x
+
+    total 1310 MOP | CPU 2163 ms (0.61 GOPS, 0.46 inf/s)
+                   | VTA  26.6 ms (49.28 GOPS, 37.6 inf/s)  -> 81x
+
+Shape of the result:
+
+  - The CPU is flat at 0.5-0.8 GOPS whatever the layer: scalar int8 MACs, so time tracks op
+    count and nothing else. VTA ranges 12-56 GOPS depending on how well the shape fits.
+  - The gap widens with channel depth, 60x at 64 channels to 112x at 512: deeper channels
+    fill the 16x16 array, and the CPU gains nothing from them.
+  - The 1x1 layers are VTA's weakest (15-37x) because they are DMA bound. The CPU is at its
+    usual rate there, so the narrower gap is VTA slowing down, not the CPU speeding up.
+
+Fairness, both ways:
+
+  - The CPU baseline really does use all four cores - measured 4.09 cores across 4 threads
+    by sampling /proc/<pid>/stat deltas. (ps -C matches the idle parent, and its %CPU is a
+    lifetime average; it reads ~0 either way. Poll until a worker is actually busy.)
+  - NEITHER side is autotuned: tophub has no entries for this board and TVM reports a
+    fallback config for both. Tuning would likely help the CPU proportionally more, since
+    VTA is already at 84% of its hardware peak. Treat 81x as the right order of magnitude,
+    not a precise figure.

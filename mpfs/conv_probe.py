@@ -85,17 +85,26 @@ def my_clip(x, a_min, a_max):
     return x
 
 
-def run_conv2d(env, remote, wl, target, check_correctness=True, print_ir=False, samples=4):
+def run_conv2d(env, remote, wl, target, check_correctness=True, print_ir=False,
+                samples=int(os.environ.get("CONV_SAMPLES", "4"))):
 
     # Workload assertions
     assert wl.hpad == wl.wpad
 
     # Perform packing only if we are targeting the accelerator
-    if "arm_cpu" in target.keys:
+    if "vta" not in target.keys:
+        # CPU baseline. The stock test keys on "arm_cpu"; this board's CPU target is riscv64,
+        # whose keys are just ("cpu",). arm_cpu's spatial-pack schedule is plain loop tiling
+        # and vectorisation over TE with no Arm intrinsics, so it applies to any CPU and is a
+        # fairer baseline than the generic schedule, which does no tiling at all. Fall back to
+        # the generic one if it will not build for this target.
         data_pack = False
         layout = "NCHW"
         conv2d_fcompute = topi.arm_cpu.conv2d_nchw_spatial_pack
         conv2d_fschedule = topi.arm_cpu.schedule_conv2d_nchw_spatial_pack
+        if os.environ.get("CONV_CPU_GENERIC"):
+            conv2d_fcompute = topi.nn.conv2d_nchw
+            conv2d_fschedule = topi.generic.schedule_conv2d_nchw
     elif "vta" in target.keys:
         data_pack = True
         layout = "NCHW%dn%dc" % (env.BATCH, env.BLOCK_IN)
@@ -295,17 +304,14 @@ def run_conv2d(env, remote, wl, target, check_correctness=True, print_ir=False, 
 
     gops = (num_ops / cost.mean) / float(10**9)
     status = "PASSED" if correct else "FAILED"
-    if "arm_cpu" in target.keys:
-        device = "CPU"
-    elif "vta" in target.keys:
-        device = "VTA"
+    device = "VTA" if "vta" in target.keys else "CPU"
     print("%s CONV2D TEST %s: Time cost = %g sec/op, %g GOPS" % (device, status, cost.mean, gops))
 
     return correct, cost, stats
 
 
 @pytest.mark.parametrize("device", ["vta", "arm_cpu"])
-def test_conv2d(device):
+def test_conv2d(device=os.environ.get("CONV_DEV", "vta")):
     def _run(env, remote):
         if device == "vta":
             target = env.target
@@ -315,7 +321,7 @@ def test_conv2d(device):
                 assert tvm.runtime.enabled("rpc")
                 program_fpga(remote, bitstream=None)
                 reconfig_runtime(remote)
-        elif device == "arm_cpu":
+        else:  # "cpu": the board's own riscv64 cores, same layers, same TVM stack
             target = env.target_vta_cpu
         with autotvm.tophub.context(target):  # load pre-tuned schedule parameters
             # CONV_ONLY=<name substring> runs a single layer, for iterating on one shape.
@@ -330,5 +336,6 @@ def test_conv2d(device):
 
 
 if __name__ == "__main__":
-    # VTA only: the arm_cpu reference path is meaningless on a riscv64 board.
-    test_conv2d(device="vta")
+    # CONV_DEV=vta (default) or cpu - the board's riscv64 cores - for a like-for-like
+    # comparison of the same layers through the same TVM stack.
+    test_conv2d()
