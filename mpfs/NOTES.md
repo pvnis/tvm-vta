@@ -2018,3 +2018,44 @@ Fairness, both ways:
     fallback config for both. Tuning would likely help the CPU proportionally more, since
     VTA is already at 84% of its hardware peak. Treat 81x as the right order of magnitude,
     not a precise figure.
+
+## Autotuning is blocked by the VTA conv2d template in TVM v0.18 (2026-09-27)
+
+Setup got as far as working: an RPC tracker on the host, the board registering under key
+"mpfs" (VTA_RPC_TRACKER / VTA_RPC_KEY, read by start_rpc_server.sh from a systemd drop-in),
+a builder that cross compiles with cc.cross_compiler(riscv gcc), and default_module_loader
+- NOT vta.module_loader(), which reprograms the FPGA before every measurement by
+downloading a bitstream that does not exist for this board.
+
+What blocks it: autotvm cannot build the config space for "conv2d_packed.vta".
+
+    TVMError: Operate on iter var T.iter_var(j, T.Range(0, 7), "DataPar", "")
+              that has already been split
+
+schedule_conv2d_packed assumes outs[0] is an EPILOGUE op after the convolution: it tiles
+and reorders `output`, then compute_at's `conv2d_stage` into it. The matching compute,
+conv2d_packed, returns the bare conv2d_dense tensor with no epilogue, so when autotvm
+creates the task, output IS conv2d_stage - the same stage gets split twice and compute_at'd
+into itself. There is no guard for this case.
+
+It is not how the task is built: the same error appears whether the task comes from
+autotvm.task.create with hand-made placeholders or from autotvm.task.extract_from_program
+on a relay graph that graph_pack has packed. (Two things learned on the way: graph_pack
+starts packing AFTER the op named by start_name, so naming the conv itself leaves it
+unpacked and the task falls back to CPU templates - put a marker op such as a 1x1
+max_pool2d in front; and a server registered with a tracker rejects plain direct
+connections with "Wrong client header length", so the tracker drop-in has to come off again
+for the normal workflow.)
+
+Fixing it means patching schedule_conv2d_packed to handle the no-epilogue case - probably
+s.cache_write to split the output copy from the accumulation - which is upstream scheduling
+code, and the tuned configs would then be applied in the epilogue case that conv_probe
+actually uses.
+
+Whether it is worth it: probably not much. VTA already runs at 84% of peak, 81-96% MAC
+utilisation on the 3x3 layers, so there is at most ~19% there. The real headroom is the 1x1
+layers at 22-35%, but they are 38 of 1310 MOP and 2.5 of 26.6 ms, so even doubling them
+saves ~4% overall. A realistic total is 5-20%.
+
+Board left in the working configuration: tracker drop-in moved to /root/tracker.conf.disabled,
+start_rpc_server.sh keeps the VTA_RPC_TRACKER support but it is unset, direct connections work.
